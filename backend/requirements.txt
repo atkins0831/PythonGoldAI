@@ -1,0 +1,13 @@
+fastapi
+uvicorn==0.30.1
+joblib==1.4.2
+scikit-learn
+pandas
+numpy
+yfinance==0.2.40
+pydantic==2.7.4
+gradio>=6.0.0
+matplotlib
+seaborn
+curl_cffi
+plotly
