@@ -117,11 +117,39 @@ app.add_middleware(
 # 6. Helper 業務邏輯函式
 # ======================================================
 def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
-    logger.info("📡 正在透過 yfinance 擷取 GC=F 與 DX-Y.NYB 即時數據...")
-    gold_df = yf.Ticker("GC=F").history(period="1mo").reset_index()
-    gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
+    logger.info("📡 正在透過 yfinance 擷取黃金與美元指數即時數據 (含多標的備份機制)...")
+    
+    # 1. 嘗試擷取黃金標的 (GC=F -> GLD -> XAUUSD=X)
+    gold_df = pd.DataFrame()
+    gold_symbols = ["GC=F", "GLD", "XAUUSD=X"]
+    for sym in gold_symbols:
+        try:
+            df_temp = yf.Ticker(sym).history(period="2mo").reset_index()
+            if not df_temp.empty and len(df_temp) >= 5:
+                gold_df = df_temp
+                logger.info(f"✅ 成功擷取黃金標的數據: {sym}")
+                break
+        except Exception as e:
+            logger.warning(f"⚠️ 標的 {sym} 擷取失敗，嘗試下一個備份標的...")
 
-    dxy_df = yf.Ticker("DX-Y.NYB").history(period="1mo").reset_index()
+    # 2. 嘗試擷取美元指數標的 (DX-Y.NYB -> UUP -> DX=F)
+    dxy_df = pd.DataFrame()
+    dxy_symbols = ["DX-Y.NYB", "UUP", "DX=F"]
+    for sym in dxy_symbols:
+        try:
+            df_temp = yf.Ticker(sym).history(period="2mo").reset_index()
+            if not df_temp.empty and len(df_temp) >= 5:
+                dxy_df = df_temp
+                logger.info(f"✅ 成功擷取美元指數標的數據: {sym}")
+                break
+        except Exception as e:
+            logger.warning(f"⚠️ 標的 {sym} 擷取失敗，嘗試下一個備份標的...")
+
+    # 防護機制：萬一全部標的都被封鎖，拋出明確例外
+    if gold_df.empty or dxy_df.empty:
+        raise ValueError("Yahoo Finance 暫時限制連線，無法順利取得黃金或美元指數數據")
+
+    gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
     dxy_df["Date"] = pd.to_datetime(dxy_df["Date"]).dt.tz_localize(None)
     dxy_df = dxy_df[["Date", "Close"]].rename(columns={"Close": "DXY_Close"})
 
@@ -154,6 +182,8 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
     
     X_latest = pd.DataFrame([latest_row[feature_cols]])
     return X_latest, latest_price, latest_dxy, latest_date
+
+
 
 # 核心推論函式 (供 REST API 與 Gradio 共同呼叫)
 def run_prediction_logic():
@@ -189,52 +219,46 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30):
-    """抓取黃金歷史資料，並預測未來 N 天趨勢（僅顯示純未來預測，隱藏歷史資料）"""
-    logger.info(f"📡 正在抓取黃金 (GC=F) 資料並計算未來 {days} 天趨勢...")
+    """抓取黃金歷史資料，並預測未來 N 天趨勢（含多標的備份機制）"""
+    logger.info(f"📡 正在抓取黃金資料並計算未來 {days} 天趨勢...")
     
     try:
-        gold_ticker = yf.Ticker("GC=F")
-        gold_df = gold_ticker.history(period="6mo")
-        
-        if gold_df.empty:
-            logger.warning("⚠️ yfinance 未能取得 GC=F 數據，嘗試使用 GLD 替代...")
-            gold_df = yf.Ticker("GLD").history(period="6mo")
+        gold_df = pd.DataFrame()
+        for sym in ["GC=F", "GLD", "XAUUSD=X"]:
+            try:
+                df_temp = yf.Ticker(sym).history(period="6mo").reset_index()
+                if not df_temp.empty and len(df_temp) >= 10:
+                    gold_df = df_temp
+                    break
+            except Exception:
+                continue
 
         if gold_df.empty:
-            raise ValueError("無法取得黃金市場數據 (GC=F 與 GLD 皆為空)")
+            raise ValueError("無法取得黃金市場數據 (所有備份標的皆無回應)")
 
-        gold_df = gold_df.reset_index()
-        
         if "Date" in gold_df.columns:
             gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
         
         gold_df = gold_df[["Date", "Close"]].dropna()
 
-        if len(gold_df) < 10:
-            raise ValueError(f"黃金數據筆數過少 (僅 {len(gold_df)} 筆)，無法建立 Holt-Winters 模型")
-
-        # 建立時間序列 Holt-Winters 模型
+        # 時間序列 Holt-Winters 模型
         model = ExponentialSmoothing(
             gold_df["Close"].values,
             trend="add", 
             seasonal=None
         ).fit()
         
-        # 進行未來 N 天的預測
         future_days = int(days)
         forecast_values = model.forecast(future_days)
         
-        # 以最後一個歷史交易日為基底，產生未來的日期
         last_date = gold_df["Date"].iloc[-1]
         future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days)
         
-        # 僅建立【未來預測數據】DataFrame，完全不包含歷史資料
         df_forecast = pd.DataFrame({
             "日期": future_dates,
             "預測金價 (USD)": [round(val, 2) for val in forecast_values]
         })
         
-        # 繪製 Plotly 線條圖 (含數據點標示)
         fig = px.line(
             df_forecast, x="日期", y="預測金價 (USD)",
             title=f"🥇 黃金未來 {future_days} 天趨勢推演 (純預測區間)",
@@ -299,6 +323,22 @@ async def get_gold_forecast_api(days: int = 30):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"金價預測失敗: {str(e)}")
+
+@app.get("/api/v1/gold-history", summary="黃金近期歷史走勢")
+async def get_gold_history_api(days: int = 60):
+    try:
+        period = "1mo" if days <= 30 else "3mo"
+        gold_df = yf.Ticker("GC=F").history(period=period).reset_index()
+        if gold_df.empty:
+            raise ValueError("無法取得黃金市場數據 (GC=F)")
+        gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
+        history = [
+            {"date": str(row["Date"]).split()[0], "price": round(float(row["Close"]), 2)}
+            for _, row in gold_df.tail(days).iterrows()
+        ]
+        return {"status": "success", "history": history}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"歷史走勢載入失敗: {str(e)}")
 
 # ======================================================
 # 8. 建立 Gradio UI 並掛載至 FastAPI
