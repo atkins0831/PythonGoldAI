@@ -3,6 +3,7 @@ import time
 import logging
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Tuple
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
 import joblib
 import numpy as np
@@ -31,7 +32,7 @@ logger = logging.getLogger("GoldMindApp")
 # 2. 全域變數與 Pydantic Data Models
 # ======================================================
 MODEL_PATH = "gold_rf_model.joblib"
-MAX_MODEL_AGE_DAYS = 7  # 模型過期天數門檻
+MAX_MODEL_AGE_DAYS = 1  # 模型過期天數門檻
 ml_artifacts: Dict[str, Any] = {}
 
 class HealthCheckResponse(BaseModel):
@@ -187,6 +188,57 @@ def run_prediction_logic():
         "ai_report": ai_report
     }
 
+def draw_oil_30day_forecast():
+    """抓取原油歷史資料，並預測未來 30 天走勢"""
+    logger.info("📡 正在抓取原油 (CL=F) 資料並計算未來 30 天趨勢...")
+    # 抓取近半年的原油期貨歷史數據
+    oil_df = yf.Ticker("CL=F").history(period="6mo").reset_index()
+    oil_df["Date"] = pd.to_datetime(oil_df["Date"]).dt.tz_localize(None)
+    
+    # 清洗資料
+    oil_df = oil_df[["Date", "Close"]].dropna()
+    
+    # 使用 Holt-Winters 指數平滑法進行未來 30 天時間序列預測
+    model = ExponentialSmoothing(
+        oil_df["Close"], 
+        trend="add", 
+        seasonal=None
+    ).fit()
+    
+    future_days = 30
+    forecast_values = model.forecast(future_days)
+    
+    # 建立未來 30 天的日期範圍
+    last_date = oil_df["Date"].iloc[-1]
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days)
+    
+    # 組合歷史與預測數據
+    df_history = pd.DataFrame({
+        "Date": oil_df["Date"],
+        "Price": oil_df["Close"],
+        "Type": "歷史實際價格"
+    })
+    
+    df_forecast = pd.DataFrame({
+        "Date": future_dates,
+        "Price": forecast_values,
+        "Type": "未來 30 天預測趨勢"
+    })
+    
+    df_combined = pd.concat([df_history, df_forecast], ignore_index=True)
+    
+    # 使用 Plotly 繪製趨勢圖
+    fig = px.line(
+        df_combined, x="Date", y="Price", color="Type",
+        title="🛢️ 原油 (WTI Crude Oil) 歷史走勢與未來 30 天趨勢預測",
+        labels={"Price": "原油價格 (USD/桶)", "Date": "日期"},
+        color_discrete_map={"歷史實際價格": "#1f77b4", "未來 30 天預測趨勢": "#ff7f0e"},
+        template="plotly_dark"
+    )
+    fig.update_traces(line_width=2.5)
+    return fig
+
+
 # ======================================================
 # 7. FastAPI REST API 端點
 # ======================================================
@@ -209,6 +261,27 @@ async def predict_gold():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Prediction error: {str(e)}"
         )
+
+@app.get("/api/v1/oil-30day-forecast", summary="原油未來 30 天趨勢預測")
+async def get_oil_forecast():
+    try:
+        oil_df = yf.Ticker("CL=F").history(period="3mo").reset_index()
+        oil_df = oil_df[["Date", "Close"]].dropna()
+        
+        model = ExponentialSmoothing(oil_df["Close"], trend="add").fit()
+        forecast = model.forecast(30)
+        
+        last_date = pd.to_datetime(oil_df["Date"].iloc[-1])
+        future_dates = [str((last_date + pd.Timedelta(days=i)).date()) for i in range(1, 31)]
+        
+        return {
+            "status": "success",
+            "base_date": str(last_date.date()),
+            "forecast_dates": future_dates,
+            "forecast_prices": [round(p, 2) for p in forecast]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"油價預測失敗: {str(e)}")
 
 # ======================================================
 # 8. 建立 Gradio UI 並掛載至 FastAPI
@@ -238,31 +311,63 @@ def draw_gold_chart():
     fig.update_traces(line_color="#ffd700", line_width=2.5)
     return fig
 
-with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 金價預測與 AI 投資助理") as gradio_ui:
-    gr.Markdown("# 🏆 GoldMind 智慧金價預測與投資助理 (MVP)")
-    gr.Markdown("整合 **FastAPI API + Gradio UI + 隨機森林自動化重練** 之金融儀表板")
+# with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 金價預測與 AI 投資助理") as gradio_ui:
+#     gr.Markdown("# 🏆 GoldMind 智慧金價預測與投資助理 (MVP)")
+#     gr.Markdown("整合 **FastAPI API + Gradio UI + 隨機森林自動化重練** 之金融儀表板")
     
-    with gr.Row():
-        with gr.Column(scale=2):
-            chart_output = gr.Plot(value=draw_gold_chart())
+#     with gr.Row():
+#         with gr.Column(scale=2):
+#             chart_output = gr.Plot(value=draw_gold_chart())
         
-        with gr.Column(scale=1):
-            gr.Markdown("### ⚙️ 即時 ML 預測開關")
-            btn_predict = gr.Button("🚀 抓取即時數據並執行 AI 分析", variant="primary")
+#         with gr.Column(scale=1):
+#             gr.Markdown("### ⚙️ 即時 ML 預測開關")
+#             btn_predict = gr.Button("🚀 抓取即時數據並執行 AI 分析", variant="primary")
             
-            out_price = gr.Textbox(label="當前黃金收盤價 (Close)", interactive=False)
-            out_dxy = gr.Textbox(label="當前美元指數 (DXY)", interactive=False)
-            out_prob = gr.Textbox(label="模型看多機率 (Probability)", interactive=False)
-            out_dir = gr.Textbox(label="明日預測走勢 (Direction)", interactive=False)
+#             out_price = gr.Textbox(label="當前黃金收盤價 (Close)", interactive=False)
+#             out_dxy = gr.Textbox(label="當前美元指數 (DXY)", interactive=False)
+#             out_prob = gr.Textbox(label="模型看多機率 (Probability)", interactive=False)
+#             out_dir = gr.Textbox(label="明日預測走勢 (Direction)", interactive=False)
 
-    gr.Markdown("---")
-    out_report = gr.Markdown("💡 **點擊【執行 AI 分析】按鈕，以取得最新智慧診斷報告。**")
+#     gr.Markdown("---")
+#     out_report = gr.Markdown("💡 **點擊【執行 AI 分析】按鈕，以取得最新智慧診斷報告。**")
 
-    btn_predict.click(
-        fn=gradio_handle_predict,
-        inputs=[],
-        outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
-    )
+#     btn_predict.click(
+#         fn=gradio_handle_predict,
+#         inputs=[],
+#         outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
+#     )
+
+with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷") as gradio_ui:
+    gr.Markdown("# 🏆 GoldMind 智慧金價與原油市場助理 (MVP)")
+    
+    with gr.Tabs():
+        # 分頁 1：黃金每日預測與 AI 診斷
+        with gr.TabItem("🥇 黃金預測與 AI 診斷"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    chart_output = gr.Plot(value=draw_gold_chart())
+                with gr.Column(scale=1):
+                    gr.Markdown("### ⚙️ 即時 ML 預測開關")
+                    btn_predict = gr.Button("🚀 抓取即時數據並執行 AI 分析", variant="primary")
+                    out_price = gr.Textbox(label="當前黃金收盤價 (Close)", interactive=False)
+                    out_dxy = gr.Textbox(label="當前美元指數 (DXY)", interactive=False)
+                    out_prob = gr.Textbox(label="模型看多機率", interactive=False)
+                    out_dir = gr.Textbox(label="明日預測走勢", interactive=False)
+            gr.Markdown("---")
+            out_report = gr.Markdown("💡 **點擊【執行 AI 分析】按鈕，以取得最新智慧診斷報告。**")
+
+            btn_predict.click(
+                fn=gradio_handle_predict,
+                inputs=[],
+                outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
+            )
+            
+        # 分頁 2：原油未來 30 天趨勢分析 (延伸功能)
+        with gr.TabItem("🛢️ 原油未來 30 天趨勢預測"):
+            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之原油 30 天價格推演")
+            oil_chart = gr.Plot(value=draw_oil_30day_forecast())
+            btn_refresh_oil = gr.Button("🔄 重新整理原油預測線", variant="secondary")
+            btn_refresh_oil.click(fn=draw_oil_30day_forecast, inputs=[], outputs=[oil_chart])
 
 # 關鍵：將 Gradio 掛載到 FastAPI 的 `/dashboard` 子路徑
 app = gr.mount_gradio_app(app, gradio_ui, path="/dashboard")

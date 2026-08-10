@@ -11,3 +11,4 @@ matplotlib
 seaborn
 curl_cffi
 plotly
+statsmodels
