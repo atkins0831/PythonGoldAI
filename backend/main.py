@@ -188,79 +188,70 @@ def run_prediction_logic():
         "ai_report": ai_report
     }
 
-def draw_oil_30day_forecast():
-    """抓取原油歷史資料，並預測未來 30 天趨勢 (含防空值備份機制)"""
-    logger.info("📡 正在抓取原油 (CL=F) 資料並計算未來 30 天趨勢...")
+def draw_gold_forecast(days: int = 30):
+    """抓取黃金歷史資料，並預測未來 N 天趨勢（僅顯示純未來預測，隱藏歷史資料）"""
+    logger.info(f"📡 正在抓取黃金 (GC=F) 資料並計算未來 {days} 天趨勢...")
     
     try:
-        # 1. 抓取原油期貨歷史數據
-        oil_ticker = yf.Ticker("CL=F")
-        oil_df = oil_ticker.history(period="6mo")
+        gold_ticker = yf.Ticker("GC=F")
+        gold_df = gold_ticker.history(period="6mo")
         
-        # 檢查抓到的資料是否為空
-        if oil_df.empty:
-            logger.warning("⚠️ yfinance 未能取得 CL=F 數據，嘗試使用 USO 替代...")
-            oil_df = yf.Ticker("USO").history(period="6mo")
+        if gold_df.empty:
+            logger.warning("⚠️ yfinance 未能取得 GC=F 數據，嘗試使用 GLD 替代...")
+            gold_df = yf.Ticker("GLD").history(period="6mo")
 
-        if oil_df.empty:
-            raise ValueError("無法取得原油市場數據 (CL=F 與 USO 皆為空)")
+        if gold_df.empty:
+            raise ValueError("無法取得黃金市場數據 (GC=F 與 GLD 皆為空)")
 
-        oil_df = oil_df.reset_index()
+        gold_df = gold_df.reset_index()
         
-        # 處理時區問題並保留 Date 與 Close 欄位
-        if "Date" in oil_df.columns:
-            oil_df["Date"] = pd.to_datetime(oil_df["Date"]).dt.tz_localize(None)
+        if "Date" in gold_df.columns:
+            gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
         
-        oil_df = oil_df[["Date", "Close"]].dropna()
+        gold_df = gold_df[["Date", "Close"]].dropna()
 
-        # 再次確認清理後的資料筆數是否足夠做時間序列分析
-        if len(oil_df) < 10:
-            raise ValueError(f"原油數據筆數過少 (僅 {len(oil_df)} 筆)，無法建立 Holt-Winters 模型")
+        if len(gold_df) < 10:
+            raise ValueError(f"黃金數據筆數過少 (僅 {len(gold_df)} 筆)，無法建立 Holt-Winters 模型")
 
-        # 2. 建立 ExponentialSmoothing 模型
+        # 建立時間序列 Holt-Winters 模型
         model = ExponentialSmoothing(
-            oil_df["Close"].values,  # 傳入 numpy array 避免索引錯位
+            gold_df["Close"].values,
             trend="add", 
             seasonal=None
         ).fit()
         
-        future_days = 30
+        # 進行未來 N 天的預測
+        future_days = int(days)
         forecast_values = model.forecast(future_days)
         
-        # 3. 建立未來 30 天日期
-        last_date = oil_df["Date"].iloc[-1]
+        # 以最後一個歷史交易日為基底，產生未來的日期
+        last_date = gold_df["Date"].iloc[-1]
         future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days)
         
-        # 4. 合併歷史與預測
-        df_history = pd.DataFrame({
-            "Date": oil_df["Date"],
-            "Price": oil_df["Close"],
-            "Type": "歷史實際價格"
-        })
-        
+        # 僅建立【未來預測數據】DataFrame，完全不包含歷史資料
         df_forecast = pd.DataFrame({
-            "Date": future_dates,
-            "Price": forecast_values,
-            "Type": "未來 30 天預測趨勢"
+            "日期": future_dates,
+            "預測金價 (USD)": [round(val, 2) for val in forecast_values]
         })
         
-        df_combined = pd.concat([df_history, df_forecast], ignore_index=True)
-        
-        # 5. 繪製 Plotly 圖表
+        # 繪製 Plotly 線條圖 (含數據點標示)
         fig = px.line(
-            df_combined, x="Date", y="Price", color="Type",
-            title="🛢️ 原油 (WTI Crude Oil) 歷史走勢與未來 30 天趨勢預測",
-            labels={"Price": "原油價格 (USD/桶)", "Date": "日期"},
-            color_discrete_map={"歷史實際價格": "#1f77b4", "未來 30 天預測趨勢": "#ff7f0e"},
+            df_forecast, x="日期", y="預測金價 (USD)",
+            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (純預測區間)",
+            markers=True,
             template="plotly_dark"
         )
-        fig.update_traces(line_width=2.5)
+        fig.update_traces(line_color="#ffd700", line_width=3, marker_size=7)
+        fig.update_layout(
+            hovermode="x unified",
+            xaxis_title="未來預測日期",
+            yaxis_title="預估金價 (USD/盎司)"
+        )
         return fig
 
     except Exception as e:
-        logger.error(f"❌ 原油繪圖失敗: {e}")
-        # 備份機制：回傳一張寫有錯誤提示的空圖表，防止整隻 FastAPI 服務崩潰 Exit 1
-        fig = px.line(title=f"⚠️ 原油趨勢暫時無法載入 ({str(e)})", template="plotly_dark")
+        logger.error(f"❌ 黃金趨勢繪圖失敗: {e}")
+        fig = px.line(title=f"⚠️ 黃金趨勢暫時無法載入 ({str(e)})", template="plotly_dark")
         return fig
 
 
@@ -287,26 +278,27 @@ async def predict_gold():
             detail=f"Prediction error: {str(e)}"
         )
 
-@app.get("/api/v1/oil-30day-forecast", summary="原油未來 30 天趨勢預測")
-async def get_oil_forecast():
+@app.get("/api/v1/gold-forecast", summary="黃金未來 N 天趨勢預測")
+async def get_gold_forecast_api(days: int = 30):
     try:
-        oil_df = yf.Ticker("CL=F").history(period="3mo").reset_index()
-        oil_df = oil_df[["Date", "Close"]].dropna()
+        gold_df = yf.Ticker("GC=F").history(period="3mo").reset_index()
+        gold_df = gold_df[["Date", "Close"]].dropna()
         
-        model = ExponentialSmoothing(oil_df["Close"], trend="add").fit()
-        forecast = model.forecast(30)
+        model = ExponentialSmoothing(gold_df["Close"].values, trend="add").fit()
+        forecast = model.forecast(days)
         
-        last_date = pd.to_datetime(oil_df["Date"].iloc[-1])
-        future_dates = [str((last_date + pd.Timedelta(days=i)).date()) for i in range(1, 31)]
+        last_date = pd.to_datetime(gold_df["Date"].iloc[-1])
+        future_dates = [str((last_date + pd.Timedelta(days=i)).date()) for i in range(1, days + 1)]
         
         return {
             "status": "success",
+            "forecast_days": days,
             "base_date": str(last_date.date()),
             "forecast_dates": future_dates,
             "forecast_prices": [round(p, 2) for p in forecast]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"油價預測失敗: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"金價預測失敗: {str(e)}")
 
 # ======================================================
 # 8. 建立 Gradio UI 並掛載至 FastAPI
@@ -336,38 +328,12 @@ def draw_gold_chart():
     fig.update_traces(line_color="#ffd700", line_width=2.5)
     return fig
 
-# with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 金價預測與 AI 投資助理") as gradio_ui:
-#     gr.Markdown("# 🏆 GoldMind 智慧金價預測與投資助理 (MVP)")
-#     gr.Markdown("整合 **FastAPI API + Gradio UI + 隨機森林自動化重練** 之金融儀表板")
-    
-#     with gr.Row():
-#         with gr.Column(scale=2):
-#             chart_output = gr.Plot(value=draw_gold_chart())
-        
-#         with gr.Column(scale=1):
-#             gr.Markdown("### ⚙️ 即時 ML 預測開關")
-#             btn_predict = gr.Button("🚀 抓取即時數據並執行 AI 分析", variant="primary")
-            
-#             out_price = gr.Textbox(label="當前黃金收盤價 (Close)", interactive=False)
-#             out_dxy = gr.Textbox(label="當前美元指數 (DXY)", interactive=False)
-#             out_prob = gr.Textbox(label="模型看多機率 (Probability)", interactive=False)
-#             out_dir = gr.Textbox(label="明日預測走勢 (Direction)", interactive=False)
-
-#     gr.Markdown("---")
-#     out_report = gr.Markdown("💡 **點擊【執行 AI 分析】按鈕，以取得最新智慧診斷報告。**")
-
-#     btn_predict.click(
-#         fn=gradio_handle_predict,
-#         inputs=[],
-#         outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
-#     )
-
 with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷") as gradio_ui:
-    gr.Markdown("# 🏆 GoldMind 智慧金價與原油市場助理 (MVP)")
+    gr.Markdown("# 🏆 GoldMind 智慧金價預測與投資助理 (MVP)")
     
     with gr.Tabs():
         # 分頁 1：黃金每日預測與 AI 診斷
-        with gr.TabItem("🥇 黃金預測與 AI 診斷"):
+        with gr.TabItem("🥇 黃金每日預測與 AI 診斷"):
             with gr.Row():
                 with gr.Column(scale=2):
                     chart_output = gr.Plot(value=draw_gold_chart())
@@ -387,12 +353,27 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
                 outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
             )
             
-        # 分頁 2：原油未來 30 天趨勢分析 (延伸功能)
-        with gr.TabItem("🛢️ 原油未來 30 天趨勢預測"):
-            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之原油 30 天價格推演")
-            oil_chart = gr.Plot(value=draw_oil_30day_forecast())
-            btn_refresh_oil = gr.Button("🔄 重新整理原油預測線", variant="secondary")
-            btn_refresh_oil.click(fn=draw_oil_30day_forecast, inputs=[], outputs=[oil_chart])
+        # 分頁 2：黃金未來 N 天趨勢推演 (純預測)
+        with gr.TabItem("📈 黃金未來走勢推演"):
+            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演")
+            
+            with gr.Row():
+                radio_days = gr.Radio(
+                    choices=[1, 7, 14, 30],
+                    value=30,
+                    label="🗓️ 請選擇預測天數 (Days)",
+                    info="可切換選擇未來 1 天、7 天、14 天或 30 天之預估走勢"
+                )
+            
+            # 初始化預設顯示未來 30 天純預測圖表
+            gold_forecast_chart = gr.Plot(value=draw_gold_forecast(30))
+            
+            # 當使用者選擇不同的 Radio 選項時，自動觸發重新繪圖
+            radio_days.change(
+                fn=draw_gold_forecast,
+                inputs=[radio_days],
+                outputs=[gold_forecast_chart]
+            )
 
 # 關鍵：將 Gradio 掛載到 FastAPI 的 `/dashboard` 子路徑
 app = gr.mount_gradio_app(app, gradio_ui, path="/dashboard")
