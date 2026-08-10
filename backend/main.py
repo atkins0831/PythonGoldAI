@@ -189,54 +189,79 @@ def run_prediction_logic():
     }
 
 def draw_oil_30day_forecast():
-    """抓取原油歷史資料，並預測未來 30 天走勢"""
+    """抓取原油歷史資料，並預測未來 30 天趨勢 (含防空值備份機制)"""
     logger.info("📡 正在抓取原油 (CL=F) 資料並計算未來 30 天趨勢...")
-    # 抓取近半年的原油期貨歷史數據
-    oil_df = yf.Ticker("CL=F").history(period="6mo").reset_index()
-    oil_df["Date"] = pd.to_datetime(oil_df["Date"]).dt.tz_localize(None)
     
-    # 清洗資料
-    oil_df = oil_df[["Date", "Close"]].dropna()
-    
-    # 使用 Holt-Winters 指數平滑法進行未來 30 天時間序列預測
-    model = ExponentialSmoothing(
-        oil_df["Close"], 
-        trend="add", 
-        seasonal=None
-    ).fit()
-    
-    future_days = 30
-    forecast_values = model.forecast(future_days)
-    
-    # 建立未來 30 天的日期範圍
-    last_date = oil_df["Date"].iloc[-1]
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days)
-    
-    # 組合歷史與預測數據
-    df_history = pd.DataFrame({
-        "Date": oil_df["Date"],
-        "Price": oil_df["Close"],
-        "Type": "歷史實際價格"
-    })
-    
-    df_forecast = pd.DataFrame({
-        "Date": future_dates,
-        "Price": forecast_values,
-        "Type": "未來 30 天預測趨勢"
-    })
-    
-    df_combined = pd.concat([df_history, df_forecast], ignore_index=True)
-    
-    # 使用 Plotly 繪製趨勢圖
-    fig = px.line(
-        df_combined, x="Date", y="Price", color="Type",
-        title="🛢️ 原油 (WTI Crude Oil) 歷史走勢與未來 30 天趨勢預測",
-        labels={"Price": "原油價格 (USD/桶)", "Date": "日期"},
-        color_discrete_map={"歷史實際價格": "#1f77b4", "未來 30 天預測趨勢": "#ff7f0e"},
-        template="plotly_dark"
-    )
-    fig.update_traces(line_width=2.5)
-    return fig
+    try:
+        # 1. 抓取原油期貨歷史數據
+        oil_ticker = yf.Ticker("CL=F")
+        oil_df = oil_ticker.history(period="6mo")
+        
+        # 檢查抓到的資料是否為空
+        if oil_df.empty:
+            logger.warning("⚠️ yfinance 未能取得 CL=F 數據，嘗試使用 USO 替代...")
+            oil_df = yf.Ticker("USO").history(period="6mo")
+
+        if oil_df.empty:
+            raise ValueError("無法取得原油市場數據 (CL=F 與 USO 皆為空)")
+
+        oil_df = oil_df.reset_index()
+        
+        # 處理時區問題並保留 Date 與 Close 欄位
+        if "Date" in oil_df.columns:
+            oil_df["Date"] = pd.to_datetime(oil_df["Date"]).dt.tz_localize(None)
+        
+        oil_df = oil_df[["Date", "Close"]].dropna()
+
+        # 再次確認清理後的資料筆數是否足夠做時間序列分析
+        if len(oil_df) < 10:
+            raise ValueError(f"原油數據筆數過少 (僅 {len(oil_df)} 筆)，無法建立 Holt-Winters 模型")
+
+        # 2. 建立 ExponentialSmoothing 模型
+        model = ExponentialSmoothing(
+            oil_df["Close"].values,  # 傳入 numpy array 避免索引錯位
+            trend="add", 
+            seasonal=None
+        ).fit()
+        
+        future_days = 30
+        forecast_values = model.forecast(future_days)
+        
+        # 3. 建立未來 30 天日期
+        last_date = oil_df["Date"].iloc[-1]
+        future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=future_days)
+        
+        # 4. 合併歷史與預測
+        df_history = pd.DataFrame({
+            "Date": oil_df["Date"],
+            "Price": oil_df["Close"],
+            "Type": "歷史實際價格"
+        })
+        
+        df_forecast = pd.DataFrame({
+            "Date": future_dates,
+            "Price": forecast_values,
+            "Type": "未來 30 天預測趨勢"
+        })
+        
+        df_combined = pd.concat([df_history, df_forecast], ignore_index=True)
+        
+        # 5. 繪製 Plotly 圖表
+        fig = px.line(
+            df_combined, x="Date", y="Price", color="Type",
+            title="🛢️ 原油 (WTI Crude Oil) 歷史走勢與未來 30 天趨勢預測",
+            labels={"Price": "原油價格 (USD/桶)", "Date": "日期"},
+            color_discrete_map={"歷史實際價格": "#1f77b4", "未來 30 天預測趨勢": "#ff7f0e"},
+            template="plotly_dark"
+        )
+        fig.update_traces(line_width=2.5)
+        return fig
+
+    except Exception as e:
+        logger.error(f"❌ 原油繪圖失敗: {e}")
+        # 備份機制：回傳一張寫有錯誤提示的空圖表，防止整隻 FastAPI 服務崩潰 Exit 1
+        fig = px.line(title=f"⚠️ 原油趨勢暫時無法載入 ({str(e)})", template="plotly_dark")
+        return fig
 
 
 # ======================================================
