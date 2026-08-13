@@ -31,7 +31,7 @@ logger = logging.getLogger("GoldMindApp")
 # ======================================================
 # 2. 全域變數與 Pydantic Data Models
 # ======================================================
-MODEL_PATH = "gold_rf_model_20260814.joblib"
+MODEL_PATH = "gold_rf_model.joblib"
 ml_artifacts: Dict[str, Any] = {}
 
 class HealthCheckResponse(BaseModel):
@@ -41,7 +41,7 @@ class HealthCheckResponse(BaseModel):
 
 class GoldPredictionResponse(BaseModel):
     date: str = Field(..., example="2026-08-05")
-    latest_price: float = Field(..., example=2450.50)
+    latest_price: float = Field(..., example=4406.20)
     latest_dxy: float = Field(..., example=104.25)
     prob_up: float = Field(..., example=68.5)
     threshold: float = Field(..., example=0.52)
