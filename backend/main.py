@@ -31,7 +31,7 @@ logger = logging.getLogger("GoldMindApp")
 # ======================================================
 # 2. 全域變數與 Pydantic Data Models
 # ======================================================
-MODEL_PATH = "gold_rf_model.joblib"
+MODEL_PATH = "gold_rf_model_20260814.joblib"
 ml_artifacts: Dict[str, Any] = {}
 
 class HealthCheckResponse(BaseModel):
