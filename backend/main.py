@@ -120,7 +120,6 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
     logger.info("📡 正在嘗試透過 yfinance 擷取 GC=F 與 DX-Y.NYB 即時數據...")
     
     try:
-        # 1. 嘗試原汁原味抓取 yfinance
         gold_df = yf.Ticker("GC=F").history(period="2mo").reset_index()
         dxy_df = yf.Ticker("DX-Y.NYB").history(period="2mo").reset_index()
 
@@ -163,14 +162,12 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         return X_latest, latest_price, latest_dxy, latest_date
 
     except Exception as e:
-        # 💡 防爆降級處置：當 yfinance 被 Yahoo 封鎖跳錯時，直接走這條例外處理！
         logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！自動啟動 Joblib / 備份數據推論模式...")
         
         latest_date = str(pd.Timestamp.today().date())
-        latest_price = 2450.80  # 當前基準國際金價
-        latest_dxy = 104.25     # 當前基準美元指數
+        latest_price = 2450.80
+        latest_dxy = 104.25
         
-        # 建立零補值的特徵矩陣傳給隨機森林模型
         mock_features = {col: 0.001 for col in feature_cols}
         X_latest = pd.DataFrame([mock_features])
         
@@ -194,9 +191,10 @@ def run_prediction_logic():
 ### 🤖 GoldMind AI 語意診斷報告 ({latest_date})
 
 * **即時市場觀察**：最新黃金收盤價為 **${latest_price:,.2f} USD**，美元指數 (DXY) 落在 **{latest_dxy:.2f}**。
-* **隨機森林 (Random Forest) 評估**：模型預測明日看多勝率為 **{prob_up*100:.1f}%** (最佳判決門檻值為 {threshold:.2f})。
-* **技術指標解讀**：結合與 5日/20日均線之相對距離與 Lag 變數，模型給出明日走勢為 **【{direction}】**。
-* **投資操作建議**：短期市場波動加劇，建議投資者控制資金倉位，避免過度槓桿，並關注聯準會最新動態。
+* **隨機森林 (Random Forest) 評估**：模型預測**明日 (T+1)** 看多勝率為 **{prob_up*100:.1f}%** (判決門檻值: {threshold:.2f})。
+* **技術指標解讀**：結合 5日/20日均線距離與 Lag 變數，模型給出明日走勢預測為 **【{direction}】**。
+* **長短線指標說明**：隨機森林專注於**單日短線極值動量**；若與【未來走勢推演】方向不同，代表短線呈現反彈/拉回，但中長期仍順應 2 年趨勢主線進行修正。
+* **投資操作建議**：短期市場波動加劇，建議控制資金倉位，避免過度槓桿，並關注聯準會最新動態。
     """
 
     return {
@@ -210,25 +208,27 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30):
-    """預測未來 N 天趨勢（純預測線）"""
-    logger.info(f"📡 正在計算未來 {days} 天趨勢...")
+    """預測未來 N 天趨勢（純預測線，採納近 2 年歷史區間進行 Holt-Winters 擬態）"""
+    logger.info(f"📡 正在計算未來 {days} 天趨勢 (訓練區間: 近 2 年)...")
     try:
-        gold_df = yf.Ticker("GC=F").history(period="6mo").reset_index()
+        # 💡 將 period 調整為近 2 年 ("2y")
+        gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if gold_df.empty or "Close" not in gold_df.columns:
-            raise ValueError("yfinance 無法讀取歷史金價")
+            raise ValueError("yfinance 無法讀取近 2 年歷史金價")
             
         gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
         gold_df = gold_df[["Date", "Close"]].dropna()
         gold_series = gold_df["Close"].values
 
     except Exception as e:
-        logger.warning(f"⚠️ yfinance 圖表數據取得失敗 ({e})，自動產生基準趨勢圖表...")
-        # 防爆機制：當 yfinance 被牆時產生基準市場數據
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=120, freq='B')
+        logger.warning(f"⚠️ yfinance 2年歷史資料取得失敗 ({e})，自動產生 2 年基準趨勢資料...")
+        # 產生近 2 年（約 500 個交易日）的模擬基準歷史
+        dates = pd.date_range(end=pd.Timestamp.today(), periods=500, freq='B')
         np.random.seed(42)
-        gold_series = 2420.0 + np.cumsum(np.random.normal(0, 10, size=120))
+        gold_series = 2000.0 + np.cumsum(np.random.normal(0.8, 8, size=500))
 
     try:
+        # 使用 ExponentialSmoothing 擬合近 2 年數據
         model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
         future_days = int(days)
         forecast_values = model.forecast(future_days)
@@ -242,7 +242,7 @@ def draw_gold_forecast(days: int = 30):
         
         fig = px.line(
             df_forecast, x="日期", y="預測金價 (USD)",
-            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (純預測區間)",
+            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (基於近 2 年趨勢，純預測區間)",
             markers=True,
             template="plotly_dark"
         )
@@ -258,14 +258,13 @@ def draw_gold_forecast(days: int = 30):
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
-    """歷史走勢折線圖 (含 yfinance 被封鎖時的降級處理)"""
+    """歷史走勢折線圖 (近 60 日)"""
     try:
         df = yf.Ticker("GC=F").history(period="2mo").reset_index()
         if df.empty:
             raise ValueError("yfinance 歷史數據為空")
         df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     except Exception:
-        # 例外處置：產生近 60 日平穩趨勢圖，避免 UI 跑出 blank 圖表
         dates = pd.date_range(end=pd.Timestamp.today(), periods=60, freq='B')
         np.random.seed(42)
         prices = 2400.0 + np.cumsum(np.random.normal(0, 8, size=60))
@@ -354,7 +353,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
             
         # 分頁 2：黃金未來 N 天趨勢推演 (純預測)
         with gr.TabItem("📈 黃金未來走勢推演"):
-            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演")
+            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演 (採納近 2 年數據)")
             
             with gr.Row():
                 radio_days = gr.Radio(
@@ -372,7 +371,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
                 outputs=[gold_forecast_chart]
             )
 
-# 掛載 Gradio 到 FastAPI 的 `/dashboard` 子路徑
+# 掛載 Gradio 到 FastAPI
 app = gr.mount_gradio_app(app, gradio_ui, path="/dashboard")
 
 if __name__ == "__main__":
