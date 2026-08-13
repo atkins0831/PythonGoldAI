@@ -41,7 +41,7 @@ class HealthCheckResponse(BaseModel):
 
 class GoldPredictionResponse(BaseModel):
     date: str = Field(..., example="2026-08-05")
-    latest_price: float = Field(..., example=4406.20)
+    latest_price: float = Field(..., example=2450.50)
     latest_dxy: float = Field(..., example=104.25)
     prob_up: float = Field(..., example=68.5)
     threshold: float = Field(..., example=0.52)
@@ -86,6 +86,12 @@ async def lifespan(app: FastAPI):
         ml_artifacts["model"] = pack.get("model")
         ml_artifacts["threshold"] = pack.get("threshold", 0.5)
         ml_artifacts["feature_cols"] = pack.get("feature_cols", [])
+        
+        # 💡 讀取 joblib 中備份的最後真實數據 (若 joblib 包中有打包的話)
+        ml_artifacts["last_known_X"] = pack.get("last_known_X")
+        ml_artifacts["last_known_price"] = pack.get("last_known_price")
+        ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
+        ml_artifacts["last_known_date"] = pack.get("last_known_date")
     else:
         ml_artifacts["model"] = None
         logger.error("❌ 系統將在【無模型模式】下啟動，請檢查環境。")
@@ -114,7 +120,7 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式 (含 yfinance 異常攔截與 Joblib 備份降級)
+# 6. Helper 業務邏輯函式 (含 yfinance 例外調用 joblib 快取數據)
 # ======================================================
 def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
     logger.info("📡 正在嘗試透過 yfinance 擷取 GC=F 與 DX-Y.NYB 即時數據...")
@@ -162,15 +168,29 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         return X_latest, latest_price, latest_dxy, latest_date
 
     except Exception as e:
-        logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！自動啟動 Joblib / 備份數據推論模式...")
+        logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！自動啟動 Joblib 快取數據推論模式...")
         
-        latest_date = str(pd.Timestamp.today().date())
-        latest_price = 2450.80
-        latest_dxy = 104.25
-        
-        mock_features = {col: 0.001 for col in feature_cols}
-        X_latest = pd.DataFrame([mock_features])
-        
+        # 💡 正確做法：直接優先調用 .joblib 中打包好的真實特徵與價格數據
+        cached_X = ml_artifacts.get("last_known_X")
+        latest_price = ml_artifacts.get("last_known_price")
+        latest_dxy = ml_artifacts.get("last_known_dxy")
+        latest_date = ml_artifacts.get("last_known_date")
+
+        # 若 joblib 中包含這些數據則直接使用，若無則啟動保命預設值
+        if cached_X is not None and latest_price is not None:
+            X_latest = cached_X
+            latest_price = float(latest_price)
+            latest_dxy = float(latest_dxy) if latest_dxy else 104.25
+            latest_date = str(latest_date) if latest_date else str(pd.Timestamp.today().date())
+            logger.info(f"✅ 成功從 Joblib 提取預訓練特徵矩陣與真實市場價格進行推論！({latest_date} 金價: ${latest_price})")
+        else:
+            logger.warning("⚠️ Joblib 未打包 last_known 數據，使用基準特徵填充...")
+            latest_date = str(pd.Timestamp.today().date())
+            latest_price = 2450.80
+            latest_dxy = 104.25
+            mock_features = {col: 0.001 for col in feature_cols}
+            X_latest = pd.DataFrame([mock_features])
+
         return X_latest, latest_price, latest_dxy, latest_date
 
 # 核心推論函式
@@ -211,7 +231,6 @@ def draw_gold_forecast(days: int = 30):
     """預測未來 N 天趨勢（純預測線，採納近 2 年歷史區間進行 Holt-Winters 擬態）"""
     logger.info(f"📡 正在計算未來 {days} 天趨勢 (訓練區間: 近 2 年)...")
     try:
-        # 💡 將 period 調整為近 2 年 ("2y")
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if gold_df.empty or "Close" not in gold_df.columns:
             raise ValueError("yfinance 無法讀取近 2 年歷史金價")
@@ -222,13 +241,11 @@ def draw_gold_forecast(days: int = 30):
 
     except Exception as e:
         logger.warning(f"⚠️ yfinance 2年歷史資料取得失敗 ({e})，自動產生 2 年基準趨勢資料...")
-        # 產生近 2 年（約 500 個交易日）的模擬基準歷史
         dates = pd.date_range(end=pd.Timestamp.today(), periods=500, freq='B')
         np.random.seed(42)
         gold_series = 2000.0 + np.cumsum(np.random.normal(0.8, 8, size=500))
 
     try:
-        # 使用 ExponentialSmoothing 擬合近 2 年數據
         model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
         future_days = int(days)
         forecast_values = model.forecast(future_days)
