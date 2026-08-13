@@ -74,7 +74,7 @@ def load_or_build_model(model_path: str) -> Dict[str, Any]:
         return {}
 
 # ======================================================
-# 4. Lifespan 上下文管理器
+# 4. Lifespan 上下文管理器 (完整讀取打包資訊)
 # ======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,7 +87,7 @@ async def lifespan(app: FastAPI):
         ml_artifacts["threshold"] = pack.get("threshold", 0.5)
         ml_artifacts["feature_cols"] = pack.get("feature_cols", [])
         
-        # 💡 讀取 joblib 中備份的最後真實數據 (若 joblib 包中有打包的話)
+        # 💡 解開打包在 joblib 中的真實快取數據
         ml_artifacts["last_known_X"] = pack.get("last_known_X")
         ml_artifacts["last_known_price"] = pack.get("last_known_price")
         ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
@@ -120,7 +120,7 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式 (含 yfinance 例外調用 joblib 快取數據)
+# 6. Helper 業務邏輯函式 (線上失敗時精準調用 joblib 快取)
 # ======================================================
 def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
     logger.info("📡 正在嘗試透過 yfinance 擷取 GC=F 與 DX-Y.NYB 即時數據...")
@@ -140,7 +140,6 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         df["BuyPrice"] = df["Close"] * 0.998
         df["SellPrice"] = df["Close"] * 1.002
         df["AveragePrice"] = (df["BuyPrice"] + df["SellPrice"]) / 2
-        df["Spread"] = df["SellPrice"] - df["BuyPrice"]
 
         df["Return_Lag1"] = df["AveragePrice"].pct_change().shift(1)
         df["Return_Lag2"] = df["AveragePrice"].pct_change().shift(2)
@@ -170,21 +169,20 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
     except Exception as e:
         logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！自動啟動 Joblib 快取數據推論模式...")
         
-        # 💡 正確做法：直接優先調用 .joblib 中打包好的真實特徵與價格數據
+        # 💡 精準調用 joblib 中的真實歷史特徵與價格
         cached_X = ml_artifacts.get("last_known_X")
         latest_price = ml_artifacts.get("last_known_price")
         latest_dxy = ml_artifacts.get("last_known_dxy")
         latest_date = ml_artifacts.get("last_known_date")
 
-        # 若 joblib 中包含這些數據則直接使用，若無則啟動保命預設值
         if cached_X is not None and latest_price is not None:
             X_latest = cached_X
             latest_price = float(latest_price)
             latest_dxy = float(latest_dxy) if latest_dxy else 104.25
             latest_date = str(latest_date) if latest_date else str(pd.Timestamp.today().date())
-            logger.info(f"✅ 成功從 Joblib 提取預訓練特徵矩陣與真實市場價格進行推論！({latest_date} 金價: ${latest_price})")
+            logger.info(f"✅ 成功從 Joblib 提取預訓練特徵矩陣與真實市場價格！({latest_date} 金價: ${latest_price})")
         else:
-            logger.warning("⚠️ Joblib 未打包 last_known 數據，使用基準特徵填充...")
+            logger.warning("⚠️ Joblib 未包含快取數據，使用預設保護值...")
             latest_date = str(pd.Timestamp.today().date())
             latest_price = 2450.80
             latest_dxy = 104.25
@@ -228,7 +226,7 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30):
-    """預測未來 N 天趨勢（純預測線，採納近 2 年歷史區間進行 Holt-Winters 擬態）"""
+    """預測未來 N 天趨勢（純預測線，採納近 2 年歷史區間）"""
     logger.info(f"📡 正在計算未來 {days} 天趨勢 (訓練區間: 近 2 年)...")
     try:
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
