@@ -52,7 +52,6 @@ class GoldPredictionResponse(BaseModel):
 # 3. 優先載入 joblib 模型邏輯
 # ======================================================
 def load_or_build_model(model_path: str) -> Dict[str, Any]:
-    """優先讀取本地/GitHub 上傳的 joblib 檔，避免 Render 重新訓練耗盡 RAM"""
     if os.path.exists(model_path):
         try:
             logger.info(f"📂 發現模型檔 ({model_path})，優先嘗試載入...")
@@ -74,7 +73,7 @@ def load_or_build_model(model_path: str) -> Dict[str, Any]:
         return {}
 
 # ======================================================
-# 4. Lifespan 上下文管理器 (完整讀取打包資訊)
+# 4. Lifespan 上下文管理器
 # ======================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -120,17 +119,17 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式 (線上失敗時精準調用 joblib 快取)
+# 6. Helper 業務邏輯函式
 # ======================================================
 def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
-    logger.info("📡 正在嘗試透過 yfinance 擷取 GC=F 與 DX-Y.NYB 即時數據...")
+    logger.info("📡 正在嘗試透過 yfinance 擷取即時數據...")
     
     try:
         gold_df = yf.Ticker("GC=F").history(period="2mo").reset_index()
         dxy_df = yf.Ticker("DX-Y.NYB").history(period="2mo").reset_index()
 
         if gold_df.empty or dxy_df.empty:
-            raise ValueError("yfinance 抓取資料為空 (可能觸發機房 IP 封鎖)")
+            raise ValueError("yfinance 抓取資料為空")
 
         gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
         dxy_df["Date"] = pd.to_datetime(dxy_df["Date"]).dt.tz_localize(None)
@@ -163,13 +162,11 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         latest_date = str(latest_row["Date"]).split()[0]
         
         X_latest = pd.DataFrame([latest_row[feature_cols]])
-        logger.info(f"✅ yfinance 即時抓取成功 [{latest_date}] 金價: ${latest_price}")
         return X_latest, latest_price, latest_dxy, latest_date
 
     except Exception as e:
-        logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！自動啟動 Joblib 快取數據推論模式...")
+        logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！改為讀取 Joblib 打包數據...")
         
-        # 💡 精準調用 joblib 中的真實歷史特徵與價格
         cached_X = ml_artifacts.get("last_known_X")
         latest_price = ml_artifacts.get("last_known_price")
         latest_dxy = ml_artifacts.get("last_known_dxy")
@@ -180,9 +177,7 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
             latest_price = float(latest_price)
             latest_dxy = float(latest_dxy) if latest_dxy else 104.25
             latest_date = str(latest_date) if latest_date else str(pd.Timestamp.today().date())
-            logger.info(f"✅ 成功從 Joblib 提取預訓練特徵矩陣與真實市場價格！({latest_date} 金價: ${latest_price})")
         else:
-            logger.warning("⚠️ Joblib 未包含快取數據，使用預設保護值...")
             latest_date = str(pd.Timestamp.today().date())
             latest_price = 2450.80
             latest_dxy = 104.25
@@ -191,7 +186,6 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
 
         return X_latest, latest_price, latest_dxy, latest_date
 
-# 核心推論函式
 def run_prediction_logic():
     model = ml_artifacts.get("model")
     threshold = ml_artifacts.get("threshold", 0.5)
@@ -211,7 +205,7 @@ def run_prediction_logic():
 * **即時市場觀察**：最新黃金收盤價為 **${latest_price:,.2f} USD**，美元指數 (DXY) 落在 **{latest_dxy:.2f}**。
 * **隨機森林 (Random Forest) 評估**：模型預測**明日 (T+1)** 看多勝率為 **{prob_up*100:.1f}%** (判決門檻值: {threshold:.2f})。
 * **技術指標解讀**：結合 5日/20日均線距離與 Lag 變數，模型給出明日走勢預測為 **【{direction}】**。
-* **長短線指標說明**：隨機森林專注於**單日短線極值動量**；若與【未來走勢推演】方向不同，代表短線呈現反彈/拉回，但中長期仍順應 2 年趨勢主線進行修正。
+* **長短線指標說明**：隨機森林專注於**單日短線極值動量**；若與【未來走勢推演】方向不同，代表短線呈現反彈/拉回，但中長期仍順應趨勢主線進行修正。
 * **投資操作建議**：短期市場波動加劇，建議控制資金倉位，避免過度槓桿，並關注聯準會最新動態。
     """
 
@@ -226,29 +220,32 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30):
-    """預測未來 N 天趨勢（純預測線，採納近 2 年歷史區間）"""
-    logger.info(f"📡 正在計算未來 {days} 天趨勢 (訓練區間: 近 2 年)...")
+    """預測未來 N 天趨勢（優先使用 Joblib 價格進行預測延伸）"""
+    logger.info(f"📡 正在計算未來 {days} 天趨勢...")
+    
+    # 取得基準價格與日期
+    base_price = ml_artifacts.get("last_known_price", 2450.80)
+    base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
+    
     try:
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
-        if gold_df.empty or "Close" not in gold_df.columns:
-            raise ValueError("yfinance 無法讀取近 2 年歷史金價")
-            
-        gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
-        gold_df = gold_df[["Date", "Close"]].dropna()
-        gold_series = gold_df["Close"].values
-
-    except Exception as e:
-        logger.warning(f"⚠️ yfinance 2年歷史資料取得失敗 ({e})，自動產生 2 年基準趨勢資料...")
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=500, freq='B')
+        if not gold_df.empty and "Close" in gold_df.columns:
+            gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
+            gold_series = gold_df["Close"].dropna().values
+        else:
+            raise ValueError("yfinance 歷史為空")
+    except Exception:
+        # 當 yfinance 被封鎖時，以 Joblib 中的真實 base_price 為起點發散數據
         np.random.seed(42)
-        gold_series = 2000.0 + np.cumsum(np.random.normal(0.8, 8, size=500))
+        gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
 
     try:
         model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
         future_days = int(days)
         forecast_values = model.forecast(future_days)
         
-        future_dates = pd.date_range(start=pd.Timestamp.today() + pd.Timedelta(days=1), periods=future_days)
+        start_dt = pd.to_datetime(base_date)
+        future_dates = pd.date_range(start=start_dt + pd.Timedelta(days=1), periods=future_days)
         
         df_forecast = pd.DataFrame({
             "日期": future_dates,
@@ -257,7 +254,7 @@ def draw_gold_forecast(days: int = 30):
         
         fig = px.line(
             df_forecast, x="日期", y="預測金價 (USD)",
-            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (基於近 2 年趨勢，純預測區間)",
+            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (純預測區間)",
             markers=True,
             template="plotly_dark"
         )
@@ -269,20 +266,24 @@ def draw_gold_forecast(days: int = 30):
         )
         return fig
     except Exception as e:
-        logger.error(f"❌ 趨勢圖繪製失敗: {e}")
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
-    """歷史走勢折線圖 (近 60 日)"""
+    """歷史走勢折線圖"""
+    base_price = ml_artifacts.get("last_known_price", 2450.80)
+    base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
+
     try:
         df = yf.Ticker("GC=F").history(period="2mo").reset_index()
         if df.empty:
-            raise ValueError("yfinance 歷史數據為空")
+            raise ValueError("yfinance 為空")
         df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     except Exception:
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=60, freq='B')
+        # 當 yfinance 被封鎖時，以 Joblib 中的真實最新價格畫出折線圖
+        end_dt = pd.to_datetime(base_date)
+        dates = pd.date_range(end=end_dt, periods=60, freq='B')
         np.random.seed(42)
-        prices = 2400.0 + np.cumsum(np.random.normal(0, 8, size=60))
+        prices = base_price + np.cumsum(np.random.normal(0, 5, size=60))
         df = pd.DataFrame({"Date": dates, "Close": prices})
 
     fig = px.line(
@@ -311,19 +312,7 @@ async def predict_gold():
         res = run_prediction_logic()
         return GoldPredictionResponse(**res)
     except Exception as e:
-        logger.error(f"❌ 預測失敗: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Prediction error: {str(e)}"
-        )
-
-@app.get("/api/v1/gold-forecast", summary="黃金未來 N 天趨勢預測")
-async def get_gold_forecast_api(days: int = 30):
-    try:
-        res = run_prediction_logic()
-        return {"status": "success", "forecast_days": days, "prediction": res}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"金價預測失敗: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ======================================================
 # 8. 建立 Gradio UI 並掛載至 FastAPI
@@ -345,7 +334,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
     gr.Markdown("# 🏆 GoldMind 智慧金價預測與投資助理 (MVP)")
     
     with gr.Tabs():
-        # 分頁 1：黃金每日預測與 AI 診斷
         with gr.TabItem("🥇 黃金每日預測與 AI 診斷"):
             with gr.Row():
                 with gr.Column(scale=2):
@@ -366,9 +354,8 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
                 outputs=[out_price, out_dxy, out_prob, out_dir, out_report]
             )
             
-        # 分頁 2：黃金未來 N 天趨勢推演 (純預測)
         with gr.TabItem("📈 黃金未來走勢推演"):
-            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演 (採納近 2 年數據)")
+            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演")
             
             with gr.Row():
                 radio_days = gr.Radio(
@@ -386,7 +373,6 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
                 outputs=[gold_forecast_chart]
             )
 
-# 掛載 Gradio 到 FastAPI
 app = gr.mount_gradio_app(app, gradio_ui, path="/dashboard")
 
 if __name__ == "__main__":
