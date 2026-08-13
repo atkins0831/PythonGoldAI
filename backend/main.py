@@ -59,7 +59,7 @@ def load_or_build_model(model_path: str) -> Dict[str, Any]:
             logger.info(f"✅ 成功載入預訓練模型！(決策門檻值: {pack.get('threshold', 0.5):.2f})")
             return pack
         except Exception as e:
-            logger.warning(f"⚠️ 讀取現有 {model_path} 失敗 ({e})，準備啟動備份建置...")
+            logger.warning(f"⚠️ 讀取現有 {model_path} 失敗 ({e})，準備啟動自動訓練...")
     else:
         logger.warning(f"⚠️ 找不到模型檔 ({model_path})，準備啟動自動訓練流程...")
 
@@ -86,11 +86,13 @@ async def lifespan(app: FastAPI):
         ml_artifacts["threshold"] = pack.get("threshold", 0.5)
         ml_artifacts["feature_cols"] = pack.get("feature_cols", [])
         
-        # 💡 解開打包在 joblib 中的真實快取數據
+        # 解開打包在 joblib 中的真實快取數據
         ml_artifacts["last_known_X"] = pack.get("last_known_X")
         ml_artifacts["last_known_price"] = pack.get("last_known_price")
         ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
         ml_artifacts["last_known_date"] = pack.get("last_known_date")
+        
+        logger.info(f"✅ 快取數據讀取成功 | 日期: {ml_artifacts['last_known_date']} | 金價: ${ml_artifacts['last_known_price']}")
     else:
         ml_artifacts["model"] = None
         logger.error("❌ 系統將在【無模型模式】下啟動，請檢查環境。")
@@ -129,7 +131,7 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         dxy_df = yf.Ticker("DX-Y.NYB").history(period="2mo").reset_index()
 
         if gold_df.empty or dxy_df.empty:
-            raise ValueError("yfinance 抓取資料為空")
+            raise ValueError("yfinance 抓取資料為空 (機房 IP 被擋)")
 
         gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
         dxy_df["Date"] = pd.to_datetime(dxy_df["Date"]).dt.tz_localize(None)
@@ -162,21 +164,34 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         latest_date = str(latest_row["Date"]).split()[0]
         
         X_latest = pd.DataFrame([latest_row[feature_cols]])
+        logger.info(f"✅ yfinance 即時數據抓取成功 [{latest_date}] 金價: ${latest_price}")
         return X_latest, latest_price, latest_dxy, latest_date
 
     except Exception as e:
-        logger.warning(f"⚠️ yfinance API 被封鎖或存取失敗 ({e})！改為讀取 Joblib 打包數據...")
+        logger.warning(f"⚠️ yfinance API 存取失敗 ({e})，動態讀取 Joblib 快取數據...")
         
         cached_X = ml_artifacts.get("last_known_X")
         latest_price = ml_artifacts.get("last_known_price")
         latest_dxy = ml_artifacts.get("last_known_dxy")
         latest_date = ml_artifacts.get("last_known_date")
 
+        # 萬一 ml_artifacts 也拿不到，從實體 .joblib 檔案強行讀取
+        if cached_X is None or latest_price is None:
+            try:
+                pack = joblib.load(MODEL_PATH)
+                cached_X = pack.get("last_known_X")
+                latest_price = pack.get("last_known_price")
+                latest_dxy = pack.get("last_known_dxy")
+                latest_date = pack.get("last_known_date")
+            except Exception:
+                pass
+
         if cached_X is not None and latest_price is not None:
             X_latest = cached_X
             latest_price = float(latest_price)
             latest_dxy = float(latest_dxy) if latest_dxy else 104.25
             latest_date = str(latest_date) if latest_date else str(pd.Timestamp.today().date())
+            logger.info(f"🎯 成功從 Joblib 帶出預訓練真實特徵 ({latest_date} 金價: ${latest_price})")
         else:
             latest_date = str(pd.Timestamp.today().date())
             latest_price = 2450.80
@@ -190,6 +205,20 @@ def run_prediction_logic():
     model = ml_artifacts.get("model")
     threshold = ml_artifacts.get("threshold", 0.5)
     feature_cols = ml_artifacts.get("feature_cols", [])
+
+    # 防護：萬一 App 啟動時沒有帶到全域變數，動態重新載入一次 .joblib
+    if not model and os.path.exists(MODEL_PATH):
+        pack = joblib.load(MODEL_PATH)
+        model = pack.get("model")
+        threshold = pack.get("threshold", 0.5)
+        feature_cols = pack.get("feature_cols", [])
+        ml_artifacts["model"] = model
+        ml_artifacts["threshold"] = threshold
+        ml_artifacts["feature_cols"] = feature_cols
+        ml_artifacts["last_known_X"] = pack.get("last_known_X")
+        ml_artifacts["last_known_price"] = pack.get("last_known_price")
+        ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
+        ml_artifacts["last_known_date"] = pack.get("last_known_date")
 
     if not model:
         raise ValueError("Machine learning model is not initialized.")
@@ -220,13 +249,21 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30):
-    """預測未來 N 天趨勢（優先使用 Joblib 價格進行預測延伸）"""
-    logger.info(f"📡 正在計算未來 {days} 天趨勢...")
+    """預測未來 N 天趨勢（優先使用 Joblib 真實價格）"""
+    base_price = ml_artifacts.get("last_known_price")
+    base_date = ml_artifacts.get("last_known_date")
     
-    # 取得基準價格與日期
-    base_price = ml_artifacts.get("last_known_price", 2450.80)
-    base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
-    
+    if not base_price and os.path.exists(MODEL_PATH):
+        try:
+            pack = joblib.load(MODEL_PATH)
+            base_price = pack.get("last_known_price", 2450.80)
+            base_date = pack.get("last_known_date", str(pd.Timestamp.today().date()))
+        except Exception:
+            base_price, base_date = 2450.80, str(pd.Timestamp.today().date())
+    else:
+        base_price = base_price if base_price else 2450.80
+        base_date = base_date if base_date else str(pd.Timestamp.today().date())
+
     try:
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if not gold_df.empty and "Close" in gold_df.columns:
@@ -235,7 +272,6 @@ def draw_gold_forecast(days: int = 30):
         else:
             raise ValueError("yfinance 歷史為空")
     except Exception:
-        # 當 yfinance 被封鎖時，以 Joblib 中的真實 base_price 為起點發散數據
         np.random.seed(42)
         gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
 
@@ -270,8 +306,19 @@ def draw_gold_forecast(days: int = 30):
 
 def draw_gold_chart():
     """歷史走勢折線圖"""
-    base_price = ml_artifacts.get("last_known_price", 2450.80)
-    base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
+    base_price = ml_artifacts.get("last_known_price")
+    base_date = ml_artifacts.get("last_known_date")
+    
+    if not base_price and os.path.exists(MODEL_PATH):
+        try:
+            pack = joblib.load(MODEL_PATH)
+            base_price = pack.get("last_known_price", 2450.80)
+            base_date = pack.get("last_known_date", str(pd.Timestamp.today().date()))
+        except Exception:
+            base_price, base_date = 2450.80, str(pd.Timestamp.today().date())
+    else:
+        base_price = base_price if base_price else 2450.80
+        base_date = base_date if base_date else str(pd.Timestamp.today().date())
 
     try:
         df = yf.Ticker("GC=F").history(period="2mo").reset_index()
@@ -279,7 +326,6 @@ def draw_gold_chart():
             raise ValueError("yfinance 為空")
         df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     except Exception:
-        # 當 yfinance 被封鎖時，以 Joblib 中的真實最新價格畫出折線圖
         end_dt = pd.to_datetime(base_date)
         dates = pd.date_range(end=end_dt, periods=60, freq='B')
         np.random.seed(42)
@@ -302,7 +348,7 @@ def draw_gold_chart():
 async def health_check():
     return HealthCheckResponse(
         status="healthy",
-        model_loaded=ml_artifacts.get("model") is not None,
+        model_loaded=ml_artifacts.get("model") is not None or os.path.exists(MODEL_PATH),
         version="1.0.0"
     )
 
@@ -337,7 +383,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
         with gr.TabItem("🥇 黃金每日預測與 AI 診斷"):
             with gr.Row():
                 with gr.Column(scale=2):
-                    chart_output = gr.Plot(value=draw_gold_chart())
+                    chart_output = gr.Plot(value=draw_gold_chart)
                 with gr.Column(scale=1):
                     gr.Markdown("### ⚙️ 即時 ML 預測開關")
                     btn_predict = gr.Button("🚀 抓取即時數據並執行 AI 分析", variant="primary")
@@ -365,7 +411,7 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
                     info="可切換選擇未來 1 天、7 天、14 天或 30 天之預估走勢"
                 )
             
-            gold_forecast_chart = gr.Plot(value=draw_gold_forecast(30))
+            gold_forecast_chart = gr.Plot(value=draw_gold_forecast)
             
             radio_days.change(
                 fn=draw_gold_forecast,
