@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import gradio as gr
+import plotly.graph_objects as go
 import plotly.express as px
 
 # 引用訓練腳本中的建構函式
@@ -175,7 +176,6 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         latest_dxy = ml_artifacts.get("last_known_dxy")
         latest_date = ml_artifacts.get("last_known_date")
 
-        # 萬一 ml_artifacts 也拿不到，從實體 .joblib 檔案強行讀取
         if cached_X is None or latest_price is None:
             try:
                 pack = joblib.load(MODEL_PATH)
@@ -206,7 +206,6 @@ def run_prediction_logic():
     threshold = ml_artifacts.get("threshold", 0.5)
     feature_cols = ml_artifacts.get("feature_cols", [])
 
-    # 防護：萬一 App 啟動時沒有帶到全域變數，動態重新載入一次 .joblib
     if not model and os.path.exists(MODEL_PATH):
         pack = joblib.load(MODEL_PATH)
         model = pack.get("model")
@@ -248,8 +247,11 @@ def run_prediction_logic():
         "ai_report": ai_report
     }
 
-def draw_gold_forecast(days: int = 30):
-    """預測未來 N 天趨勢（優先使用 Joblib 真實價格）"""
+def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
+    """
+    [Tag: Monte Carlo Base-Case Estimation]
+    結合時間序列模型 (Holt-Winters) 與蒙地卡羅隨機模擬，進行基礎情形 (Base Case) 與 P10/P50/P90 波動區間估算。
+    """
     base_price = ml_artifacts.get("last_known_price")
     base_date = ml_artifacts.get("last_known_date")
     
@@ -276,32 +278,90 @@ def draw_gold_forecast(days: int = 30):
         gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
 
     try:
-        model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
         future_days = int(days)
-        forecast_values = model.forecast(future_days)
-        
         start_dt = pd.to_datetime(base_date)
         future_dates = pd.date_range(start=start_dt + pd.Timedelta(days=1), periods=future_days)
+        date_labels = [d.strftime("%Y-%m-%d") for d in future_dates]
+
+        # 1. 建立 Holt-Winters 基礎擬合模型 (Base Model)
+        model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
+        base_forecast = model.forecast(future_days)
         
-        df_forecast = pd.DataFrame({
-            "日期": future_dates,
-            "預測金價 (USD)": [round(val, 2) for val in forecast_values]
-        })
-        
-        fig = px.line(
-            df_forecast, x="日期", y="預測金價 (USD)",
-            title=f"🥇 黃金未來 {future_days} 天趨勢推演 (純預測區間)",
-            markers=True,
-            template="plotly_dark"
-        )
-        fig.update_traces(line_color="#ffd700", line_width=3, marker_size=7)
+        # 2. 計算歷史日波幅標準差作為隨機噪聲基底
+        daily_diffs = np.diff(gold_series)
+        volatility = np.std(daily_diffs) if len(daily_diffs) > 0 else 8.0
+
+        # 3. 執行蒙地卡羅隨機模擬 (Monte Carlo Simulations)
+        np.random.seed(42)
+        simulations = np.zeros((num_simulations, future_days))
+        for i in range(num_simulations):
+            # 幾何/隨機漫步累積噪聲 (Cumsum Random Walk)
+            shocks = np.random.normal(loc=0.0, scale=volatility * 0.4, size=future_days)
+            simulations[i] = base_forecast + np.cumsum(shocks)
+
+        # 4. 統計分位數：P10 (保守/悲觀), P50 (基礎/中位數), P90 (樂觀)
+        p10 = np.percentile(simulations, 10, axis=0)
+        p50 = np.percentile(simulations, 50, axis=0)
+        p90 = np.percentile(simulations, 90, axis=0)
+
+        # 5. 使用 Plotly 繪製 [Tag: Monte Carlo Base-Case Estimation] 區間圖表
+        fig = go.Figure()
+
+        # (a) P90 樂觀上限 (作為區域填充參考)
+        fig.add_trace(go.Scatter(
+            x=date_labels, y=p90,
+            mode='lines',
+            line=dict(width=0),
+            showlegend=False,
+            name='P90 樂觀上限'
+        ))
+
+        # (b) P10 保守下限 + P10~P90 波動區間陰影 (Shaded Range)
+        fig.add_trace(go.Scatter(
+            x=date_labels, y=p10,
+            mode='lines',
+            line=dict(width=0),
+            fill='tonexty',
+            fillcolor='rgba(255, 215, 0, 0.18)', # 半透明金色區間
+            name='P10 - P90 波動區間'
+        ))
+
+        # (c) P50 基礎情形 (Base Case / 中位數主線)
+        fig.add_trace(go.Scatter(
+            x=date_labels, y=p50,
+            mode='lines+markers',
+            line=dict(color='#ffd700', width=3),
+            marker=dict(size=5),
+            name='P50 基礎情形 (Base Case)'
+        ))
+
+        # (d) P90 樂觀界線 (虛線)
+        fig.add_trace(go.Scatter(
+            x=date_labels, y=p90,
+            mode='lines',
+            line=dict(color='#10b981', width=1.5, dash='dash'),
+            name='P90 樂觀估算'
+        ))
+
+        # (e) P10 保守界線 (虛線)
+        fig.add_trace(go.Scatter(
+            x=date_labels, y=p10,
+            mode='lines',
+            line=dict(color='#ef4444', width=1.5, dash='dash'),
+            name='P10 保守/悲觀估算'
+        ))
+
         fig.update_layout(
-            hovermode="x unified",
+            title=f"🥇 黃金未來 {future_days} 天蒙地卡羅基礎情形估算 (Monte Carlo Base-Case Estimation)",
             xaxis_title="未來預測日期",
-            yaxis_title="預估金價 (USD/盎司)"
+            yaxis_title="預估金價 (USD/盎司)",
+            hovermode="x unified",
+            template="plotly_dark",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
         )
         return fig
     except Exception as e:
+        logger.error(f"蒙地卡羅圖表生成失敗: {e}")
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
@@ -401,14 +461,15 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="GoldMind 智慧金融診斷"
             )
             
         with gr.TabItem("📈 黃金未來走勢推演"):
-            gr.Markdown("### 📊 基於時間序列模型 (Holt-Winters) 之未來價格推演")
+            gr.Markdown("### 📊 蒙地卡羅基礎情形估算 (Monte Carlo Base-Case Estimation)")
+            gr.Markdown("結合 **Holt-Winters 時間序列** 與 **1,000 次蒙地卡羅隨機抽樣**，推演未來動態走勢與 P10~P90 波動風險區間。")
             
             with gr.Row():
                 radio_days = gr.Radio(
-                    choices=[1, 7, 14, 30],
+                    choices=[3, 7, 14, 30],
                     value=30,
                     label="🗓️ 請選擇預測天數 (Days)",
-                    info="可切換選擇未來 1 天、7 天、14 天或 30 天之預估走勢"
+                    info="可切換選擇未來 3 天、7 天、14 天或 30 天之預估走勢"
                 )
             
             gold_forecast_chart = gr.Plot(value=draw_gold_forecast)
