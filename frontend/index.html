@@ -1,147 +1,131 @@
 <!DOCTYPE html>
-<html lang="zh-Hant">
+<html lang="zh-TW">
+
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GoldMind 智慧金價預測與投資助理</title>
-  <link rel="stylesheet" href="css/style.css" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GoldMind 智慧金價預測</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- Chart.js 繪製走勢圖 -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
+
 <body>
-  <header class="site-header">
-    <div class="brand">
-      <span class="brand-icon">🏆</span>
-      <div>
-        <h1>GoldMind 智慧金價預測與投資助理</h1>
-        <p class="subtitle">MVP · ML 隨機森林 + Holt-Winters 時間序列整合服務</p>
+
+  <div class="container">
+
+    <!-- 1. 頂部標題卡片 -->
+    <header class="header-card">
+      <span class="badge-pill">PYTHON 整合生成式 AI 應用班</span>
+      <h1>GoldMind 智慧金價預測</h1>
+      <p>基於機器學習與多維度經濟數據的黃金走勢預測系統</p>
+    </header>
+
+    <!-- 2. 導覽頁籤 -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" id="tabDailyBtn">黃金每日預測與 AI 診斷</button>
+      <button class="tab-btn" id="tabFutureBtn">黃金未來走勢推演</button>
+    </nav>
+
+    <!-- 均線選擇器區塊 (僅在黃金每日預測頁籤顯示) -->
+    <div class="days-selector-card" id="maSelectorCard">
+      <div class="days-selector-title">📈 請選擇技術指標 (MA 均線)</div>
+      <div class="days-selector-sub">可勾選切換顯示 5 日、10 日、20 日或 60 日移動平均線</div>
+      <div class="days-options">
+        <label class="day-radio active"><input type="checkbox" name="maOption" value="5" checked>
+          <span>5日均綫</span></label>
+        <label class="day-radio"><input type="checkbox" name="maOption" value="10"> <span>10日均綫</span></label>
+        <label class="day-radio"><input type="checkbox" name="maOption" value="20"> <span>20日均綫</span></label>
+        <label class="day-radio"><input type="checkbox" name="maOption" value="60"> <span>60日均綫</span></label>
       </div>
     </div>
-    <div class="status-banner" id="status-banner" role="status">
-      <span class="status-dot"></span>
-      <span id="status-text">正在連接服務…</span>
+
+    <!-- 天數選擇器區塊 (僅在未來走勢推演頁籤顯示) -->
+    <div class="days-selector-card" id="daysSelectorCard" style="display: none;">
+      <div class="days-selector-title">📅 請選擇預測天數 (Days)</div>
+      <div class="days-selector-sub">可切換選擇未來 3 天、7 天、14 天或 30 天之預估走勢</div>
+      <div class="days-options">
+        <label class="day-radio"><input type="radio" name="forecastDays" value="3"> <span>3</span></label>
+        <label class="day-radio"><input type="radio" name="forecastDays" value="7"> <span>7</span></label>
+        <label class="day-radio"><input type="radio" name="forecastDays" value="14"> <span>14</span></label>
+        <label class="day-radio active"><input type="radio" name="forecastDays" value="30" checked>
+          <span>30</span></label>
+      </div>
     </div>
-  </header>
 
-  <nav class="tabs" id="tabs" aria-label="功能分頁">
-    <button class="tab active" data-tab="predict">🥇 黃金每日預測與 AI 診斷</button>
-    <button class="tab" data-tab="forecast">📈 黃金未來走勢推演</button>
-    <button class="tab" data-tab="info">ℹ️ 系統資訊</button>
-  </nav>
+    <!-- 3. 主要數據與控制區塊 -->
+    <main class="main-grid">
 
-  <main class="container">
-    <!-- 分頁 1：每日預測與 AI 診斷 -->
-    <section class="panel active" id="panel-predict">
-      <div class="grid two-col">
-        <div class="card chart-card">
-          <h2>📈 黃金 (Gold Futures) 歷史走勢圖</h2>
-          <div class="chart-wrap">
-            <canvas id="historyChart"></canvas>
-          </div>
+      <!-- 左側：走勢圖表區塊 -->
+      <section class="card">
+        <h2 class="section-title" id="chartTitle">黃金 (Gold Futures) 近 60 日歷史走勢圖</h2>
+        <div class="chart-container">
+          <canvas id="goldChart"></canvas>
+        </div>
+      </section>
+
+      <!-- 右側：即時預測控制台 -->
+      <section class="card">
+        <h2 class="section-title" id="panelTitle">即時 ML 預測開關</h2>
+
+        <button class="action-btn" id="fetchDataBtn">抓取即時數據並執行 AI 分析</button>
+
+        <div class="info-group">
+          <label class="info-label" id="label1">當前黃金收盤價 (Close)</label>
+          <div class="info-value-box" id="val1">2325.40</div>
         </div>
 
-        <div class="card controls-card">
-          <h2>⚙️ 即時 ML 預測</h2>
-          <p class="hint">點擊按鈕以抓取即時數據並執行 AI 分析</p>
-          <button id="btn-predict" class="btn primary">🚀 抓取即時數據並執行 AI 分析</button>
-
-          <div class="metric-list">
-            <div class="metric">
-              <span class="metric-label">當前黃金收盤價</span>
-              <span class="metric-value" id="out-price">—</span>
-            </div>
-            <div class="metric">
-              <span class="metric-label">美元指數 (DXY)</span>
-              <span class="metric-value" id="out-dxy">—</span>
-            </div>
-            <div class="metric">
-              <span class="metric-label">模型看多機率</span>
-              <span class="metric-value" id="out-prob">—</span>
-            </div>
-            <div class="metric">
-              <span class="metric-label">明日預測走勢</span>
-              <span class="metric-value" id="out-direction">—</span>
-            </div>
-            <div class="metric">
-              <span class="metric-label">判決門檻值</span>
-              <span class="metric-value" id="out-threshold">—</span>
-            </div>
-          </div>
+        <div class="info-group">
+          <label class="info-label" id="label2">當前美元指數 (DXY)</label>
+          <div class="info-value-box" id="val2">103.12</div>
         </div>
-      </div>
 
-      <div class="card report-card">
-        <h2>🤖 AI 語意診斷報告</h2>
-        <div id="out-report" class="markdown">
-          <p>💡 點擊【執行 AI 分析】按鈕，以取得最新智慧診斷報告。</p>
+        <div class="info-group">
+          <label class="info-label" id="label3">模型看多機率</label>
+          <div class="info-value-box" id="val3">68.5%</div>
         </div>
-      </div>
+
+        <div class="info-group">
+          <label class="info-label" id="label4">明日預測走勢</label>
+          <div class="info-value-box" id="val4">看多 (Bullish)</div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- 4. AI 語意診斷報告區塊 -->
+    <section class="report-card">
+      <h2 class="section-title" id="reportTitle">GoldMind AI 語意診斷報告 (2026-08-13)</h2>
+
+      <ul class="report-list" id="reportList">
+        <li>
+          <strong>即時市場觀察：</strong>最新黃金收盤價為 <span class="highlight-gold" id="rptPrice">$2,325.40 USD</span>，美元指數 (DXY) 落在
+          <span class="highlight-val" id="rptDxy">103.12</span>。
+        </li>
+        <li>
+          <strong>隨機森林 (Random Forest) 評估：</strong>模型預測<strong>明日 (T+1)</strong> 看多勝率為 <span class="highlight-gold"
+            id="rptProb">68.5%</span> (判決門檻值: <span id="rptThreshold">0.52</span>)。
+        </li>
+        <li>
+          <strong>技術指標解讀：</strong>結合 5日/20日均線距離與 Lag 變數，模型給出走勢預測為 <span class="highlight-tag" id="rptDirection">【看多 (Bullish)】</span>。
+        </li>
+        <li>
+          <strong>長短線指標說明：</strong>隨機森林專注於<strong>單日短線極值動量</strong>；若與【未來走勢推演】方向不同，代表短線呈現反彈/拉回，但中長期仍順應趨勢主線進行修正。
+        </li>
+        <li>
+          <strong>投資操作建議：</strong>短期市場波動加劇，建議控制資金倉位，避免過度槓桿，並關注聯準會最新動態。
+        </li>
+      </ul>
     </section>
 
-    <!-- 分頁 2：未來走勢推演 -->
-    <section class="panel" id="panel-forecast">
-      <div class="card">
-        <div class="forecast-header">
-          <div>
-            <h2>📊 未來價格推演</h2>
-            <p class="hint">基於時間序列模型 (Holt-Winters) 之未來價格推演</p>
-          </div>
-          <div class="days-group" id="days-group">
-            <span class="days-label">🗓️ 預測天數</span>
-            <button class="days-btn" data-days="1">1 天</button>
-            <button class="days-btn" data-days="7">7 天</button>
-            <button class="days-btn" data-days="14">14 天</button>
-            <button class="days-btn active" data-days="30">30 天</button>
-          </div>
-        </div>
+    <!-- 5. 頁腳版權宣告 -->
+    <footer class="page-footer">
+      <p>Copyright &copy; 臺北市職能發展學院 All Rights Reserved.</p>
+    </footer>
 
-        <div class="chart-wrap tall">
-          <canvas id="forecastChart"></canvas>
-        </div>
+  </div>
 
-        <div class="forecast-table-wrap" id="forecast-table-wrap" hidden>
-          <table class="forecast-table">
-            <thead>
-              <tr>
-                <th>預測日期</th>
-                <th>預估金價 (USD/盎司)</th>
-              </tr>
-            </thead>
-            <tbody id="forecast-table-body"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- 分頁 3：系統資訊 -->
-    <section class="panel" id="panel-info">
-      <div class="card">
-        <h2>ℹ️ 系統資訊</h2>
-        <dl class="info-list" id="info-list">
-          <div class="info-row"><dt>服務狀態</dt><dd id="info-status">—</dd></div>
-          <div class="info-row"><dt>模型載入狀態</dt><dd id="info-model">—</dd></div>
-          <div class="info-row"><dt>API 版本</dt><dd id="info-version">—</dd></div>
-        </dl>
-        <div class="api-list">
-          <h3>後端 API 端點</h3>
-          <ul>
-            <li><code>GET /</code> — 健康檢查</li>
-            <li><code>POST /api/v1/predict</code> — 執行黃金預測與 AI 診斷</li>
-            <li><code>GET /api/v1/gold-forecast?days=30</code> — 未來 N 天趨勢預測</li>
-            <li><code>GET /api/v1/gold-history?days=60</code> — 近期歷史走勢</li>
-            <li><code>/dashboard</code> — Gradio 後台儀表板</li>
-          </ul>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <span>GoldMind MVP · FastAPI + scikit-learn + statsmodels</span>
-  </footer>
-
-  <div class="toast" id="toast" role="alert"></div>
-
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-  <script src="js/api.js"></script>
-  <script src="js/app.js"></script>
+  <script src="script.js"></script>
 </body>
+
 </html>

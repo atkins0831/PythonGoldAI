@@ -1,0 +1,304 @@
+/* 基礎樣式設定 - 深色主題 */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+body {
+  background-color: #0b1120;
+  color: #f8fafc;
+  padding: 24px;
+  display: flex;
+  justify-content: center;
+}
+
+.container {
+  max-width: 1200px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* 1. 頂部標題區塊 */
+.header-card {
+  background-color: #131c2e;
+  border: 2px solid #f59e0b;
+  border-radius: 12px;
+  padding: 28px 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+.badge-pill {
+  background-color: #f59e0b;
+  color: #000;
+  font-weight: 700;
+  font-size: 13px;
+  padding: 4px 16px;
+  border-radius: 20px;
+  letter-spacing: 1px;
+}
+
+.header-card h1 {
+  font-size: 32px;
+  font-weight: 800;
+  color: #ffffff;
+  letter-spacing: 1px;
+}
+
+.header-card p {
+  color: #94a3b8;
+  font-size: 15px;
+}
+
+/* 2. 頁籤導覽列 */
+.tab-nav {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.tab-btn {
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  background: transparent;
+  border: 1px solid transparent;
+  color: #94a3b8;
+}
+
+.tab-btn.active {
+  background-color: #131c2e;
+  border-color: #f59e0b;
+  color: #f59e0b;
+}
+
+.tab-btn:hover:not(.active) {
+  color: #ffffff;
+  background-color: #1a263d;
+}
+
+/* 3. 主內容網格區塊 (左：圖表 | 右：ML 控制台) */
+.main-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+}
+
+@media (max-width: 900px) {
+  .main-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.card {
+  background-color: #131c2e;
+  border: 1px solid #1e2d4a;
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.section-title {
+  font-size: 18px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #ffffff;
+}
+
+.section-title::before {
+  content: '';
+  display: inline-block;
+  width: 4px;
+  height: 18px;
+  background-color: #f59e0b;
+  border-radius: 2px;
+}
+
+/* 圖表容器 RWD 自適應優化 */
+.chart-container {
+  position: relative;
+  min-height: 350px;
+  height: 320px;
+  width: 100%;
+}
+
+/* ML 預測控制面板與按鈕 */
+.action-btn {
+  width: 100%;
+  background-color: #f59e0b;
+  color: #0f172a;
+  border: none;
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.action-btn:hover:not(:disabled) {
+  background-color: #d97706;
+}
+
+/* API 請求中狀態 */
+.action-btn:disabled {
+  background-color: #475569;
+  color: #94a3b8;
+  cursor: not-allowed;
+  opacity: 0.8;
+}
+
+.info-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.info-label {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.info-value-box {
+  background-color: #0b1120;
+  border: 1px solid #1e2d4a;
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #f59e0b;
+}
+
+/* 4. AI 語意診斷報告卡片樣式 */
+.report-card {
+  background-color: #131c2e;
+  border: 1px solid #1e2d4a;
+  border-radius: 12px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.report-list {
+  list-style-type: disc;
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.report-list li {
+  color: #cbd5e1;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.report-list strong {
+  color: #ffffff;
+}
+
+.highlight-gold {
+  color: #f59e0b;
+  font-weight: 700;
+}
+
+.highlight-val {
+  color: #38bdf8;
+  font-weight: 700;
+}
+
+.highlight-tag {
+  color: #22c55e;
+  font-weight: 700;
+}
+
+/* 預測天數與 MA 選擇器樣式 */
+.days-selector-card {
+  background-color: #131c2e;
+  border: 1px solid #1e2d4a;
+  border-radius: 12px;
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.days-selector-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.days-selector-sub {
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.days-options {
+  display: flex;
+  gap: 16px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.day-radio {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  color: #cbd5e1;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 18px;
+  background-color: #0b1120;
+  border: 1px solid #1e2d4a;
+  border-radius: 20px;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.day-radio:hover {
+  border-color: #f59e0b;
+  color: #ffffff;
+}
+
+.day-radio input[type="radio"],
+.day-radio input[type="checkbox"] {
+  accent-color: #f59e0b;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+.day-radio.active {
+  border-color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.12);
+  color: #f59e0b;
+}
+
+/* 5. 頁腳版權區塊 */
+.page-footer {
+  text-align: center;
+  padding: 16px 0 8px 0;
+  color: #64748b;
+  font-size: 14px;
+}
