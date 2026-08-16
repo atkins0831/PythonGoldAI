@@ -33,7 +33,7 @@ logger = logging.getLogger("GoldMindApp")
 # 2. 全域變數與 Pydantic Data Models
 # ======================================================
 MODEL_PATH = "gold_rf_model.joblib"
-CSV_BACKUP_PATH = "GC=F_history.csv"  # 💡 備用 CSV 歷史檔路徑
+CSV_BACKUP_PATH = "GC=F_history.csv"  # 備用 CSV 歷史檔路徑
 ml_artifacts: Dict[str, Any] = {}
 
 class HealthCheckResponse(BaseModel):
@@ -123,21 +123,35 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式 (支援讀取備用 CSV)
+# 6. Helper 業務邏輯函式 (含防爆清洗 CSV 邏輯)
 # ======================================================
-def fetch_from_csv(csv_path: str, feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
-    """💡 當線上 API 失敗時，直接讀取 GC=F_history.csv 進行特徵計算與推論"""
-    logger.info(f"📁 嘗試從本地備用檔案 {csv_path} 載入黃金歷史資料...")
+def clean_and_prepare_csv(csv_path: str) -> pd.DataFrame:
+    """💡 強效清洗 CSV 數據，防止字串、符號或日期格式導致崩潰"""
     df = pd.read_csv(csv_path)
     
-    # 時間與欄位處理
+    # 1. 處理 Date 欄位格式
     date_col = "Date" if "Date" in df.columns else df.columns[0]
-    df["Date"] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
-    df = df.sort_values("Date").reset_index(drop=True)
+    df["Date"] = pd.to_datetime(df[date_col], format='mixed', errors='coerce').dt.tz_localize(None)
+    
+    # 2. 強制將價格欄位轉為 float（移除多餘的字串與符號）
+    for col in ["Close", "Open", "High", "Low"]:
+        if col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+    return df
 
-    # 萬一 CSV 中缺乏 DXY 欄位，自動帶入預設基準
+def fetch_from_csv(csv_path: str, feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
+    """從 GC=F_history.csv 計算特徵與最新價格"""
+    logger.info(f"📁 讀取並清洗本地備用檔案 {csv_path}...")
+    df = clean_and_prepare_csv(csv_path)
+
     if "DXY_Close" not in df.columns:
         df["DXY_Close"] = 104.25
+    else:
+        df["DXY_Close"] = pd.to_numeric(df["DXY_Close"], errors='coerce').fillna(104.25)
 
     df["BuyPrice"] = df["Close"] * 0.998
     df["SellPrice"] = df["Close"] * 1.002
@@ -215,14 +229,14 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
     except Exception as e:
         logger.warning(f"⚠️ yfinance API 存取失敗 ({e})！")
         
-        # 💡 第一備份順位：優先嘗試讀取本地備用 GC=F_history.csv
+        # 1. 優先嘗試讀取本地備用 GC=F_history.csv
         if os.path.exists(CSV_BACKUP_PATH):
             try:
                 return fetch_from_csv(CSV_BACKUP_PATH, feature_cols)
             except Exception as csv_err:
                 logger.warning(f"⚠️ 讀取備用 CSV 失敗 ({csv_err})，切換至 Joblib 快取模式...")
 
-        # 💡 第二備份順位：讀取 Joblib 快取數據
+        # 2. 切換至 Joblib 快取
         cached_X = ml_artifacts.get("last_known_X")
         latest_price = ml_artifacts.get("last_known_price")
         latest_dxy = ml_artifacts.get("last_known_dxy")
@@ -300,10 +314,7 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
-    """
-    [Tag: Monte Carlo Base-Case Estimation]
-    結合時間序列模型 (Holt-Winters) 與蒙地卡羅隨機模擬 (含 CSV 數據支援)
-    """
+    """蒙地卡羅趨勢預測（修復 CSV 數據轉 float 類型問題）"""
     base_price = ml_artifacts.get("last_known_price")
     base_date = ml_artifacts.get("last_known_date")
     
@@ -325,22 +336,22 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if not gold_df.empty and "Close" in gold_df.columns:
             gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
-            gold_series = gold_df["Close"].dropna().values
+            gold_series = gold_df["Close"].dropna().values.astype(float)
     except Exception:
         pass
 
-    # 2. yfinance 失敗則讀取 CSV
+    # 2. 嘗試讀取並清洗 CSV
     if gold_series is None and os.path.exists(CSV_BACKUP_PATH):
         try:
-            df_csv = pd.read_csv(CSV_BACKUP_PATH)
-            gold_series = df_csv["Close"].dropna().values
-            date_col = "Date" if "Date" in df_csv.columns else df_csv.columns[0]
-            base_date = str(pd.to_datetime(df_csv[date_col]).iloc[-1]).split()[0]
-        except Exception:
-            pass
+            df_csv = clean_and_prepare_csv(CSV_BACKUP_PATH)
+            gold_series = df_csv["Close"].dropna().values.astype(float) # 💡 強制轉為 float 陣列
+            base_date = str(df_csv["Date"].iloc[-1]).split()[0]
+            base_price = float(df_csv["Close"].iloc[-1])
+        except Exception as e:
+            logger.warning(f"⚠️ 蒙地卡羅讀取 CSV 失敗: {e}")
 
     # 3. 若皆失敗，使用擬真備份數據
-    if gold_series is None:
+    if gold_series is None or len(gold_series) == 0:
         np.random.seed(42)
         gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
 
@@ -417,11 +428,11 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         )
         return fig
     except Exception as e:
-        logger.error(f"蒙地卡羅圖表生成失敗: {e}")
+        logger.error(f"❌ 蒙地卡羅圖表生成失敗: {e}")
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
-    """歷史走勢折線圖 (支援 CSV 歷史數據繪製)"""
+    """歷史走勢折線圖 (支援 CSV 清洗處理)"""
     df = None
 
     # 1. 嘗試 yfinance
@@ -436,9 +447,7 @@ def draw_gold_chart():
     # 2. 嘗試 CSV
     if df is None and os.path.exists(CSV_BACKUP_PATH):
         try:
-            df_csv = pd.read_csv(CSV_BACKUP_PATH)
-            date_col = "Date" if "Date" in df_csv.columns else df_csv.columns[0]
-            df_csv["Date"] = pd.to_datetime(df_csv[date_col]).dt.tz_localize(None)
+            df_csv = clean_and_prepare_csv(CSV_BACKUP_PATH)
             df = df_csv.tail(60).reset_index(drop=True)
         except Exception:
             pass
