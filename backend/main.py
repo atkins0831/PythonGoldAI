@@ -33,6 +33,7 @@ logger = logging.getLogger("GoldMindApp")
 # 2. 全域變數與 Pydantic Data Models
 # ======================================================
 MODEL_PATH = "gold_rf_model.joblib"
+CSV_BACKUP_PATH = "GC=F_history.csv"  # 💡 備用 CSV 歷史檔路徑
 ml_artifacts: Dict[str, Any] = {}
 
 class HealthCheckResponse(BaseModel):
@@ -122,8 +123,51 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式
+# 6. Helper 業務邏輯函式 (支援讀取備用 CSV)
 # ======================================================
+def fetch_from_csv(csv_path: str, feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
+    """💡 當線上 API 失敗時，直接讀取 GC=F_history.csv 進行特徵計算與推論"""
+    logger.info(f"📁 嘗試從本地備用檔案 {csv_path} 載入黃金歷史資料...")
+    df = pd.read_csv(csv_path)
+    
+    # 時間與欄位處理
+    date_col = "Date" if "Date" in df.columns else df.columns[0]
+    df["Date"] = pd.to_datetime(df[date_col]).dt.tz_localize(None)
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    # 萬一 CSV 中缺乏 DXY 欄位，自動帶入預設基準
+    if "DXY_Close" not in df.columns:
+        df["DXY_Close"] = 104.25
+
+    df["BuyPrice"] = df["Close"] * 0.998
+    df["SellPrice"] = df["Close"] * 1.002
+    df["AveragePrice"] = (df["BuyPrice"] + df["SellPrice"]) / 2
+
+    df["Return_Lag1"] = df["AveragePrice"].pct_change().shift(1)
+    df["Return_Lag2"] = df["AveragePrice"].pct_change().shift(2)
+    df["Return_Lag5"] = df["AveragePrice"].pct_change().shift(5)
+
+    ma5_lag1 = df["AveragePrice"].shift(1).rolling(5).mean()
+    ma20_lag1 = df["AveragePrice"].shift(1).rolling(20).mean()
+
+    df["Dist_MA5"] = (df["AveragePrice"].shift(1) - ma5_lag1) / ma5_lag1
+    df["Dist_MA20"] = (df["AveragePrice"].shift(1) - ma20_lag1) / ma20_lag1
+    df["Rolling_Std_Lag1"] = df["AveragePrice"].shift(1).rolling(20).std()
+
+    df["DXY_Close_Lag1"] = df["DXY_Close"].shift(1)
+    df["DXY_Return_Lag1"] = df["DXY_Close"].pct_change().shift(1)
+    dxy_ma5_lag1 = df["DXY_Close"].shift(1).rolling(5).mean()
+    df["DXY_Dist_MA5"] = (df["DXY_Close"].shift(1) - dxy_ma5_lag1) / dxy_ma5_lag1
+
+    latest_row = df.dropna(subset=feature_cols).iloc[-1]
+    latest_price = float(latest_row["Close"])
+    latest_dxy = float(latest_row["DXY_Close"])
+    latest_date = str(latest_row["Date"]).split()[0]
+    
+    X_latest = pd.DataFrame([latest_row[feature_cols]])
+    logger.info(f"✅ 成功自 CSV 計算最新歷史特徵 [{latest_date}] 金價: ${latest_price}")
+    return X_latest, latest_price, latest_dxy, latest_date
+
 def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
     logger.info("📡 正在嘗試透過 yfinance 擷取即時數據...")
     
@@ -169,8 +213,16 @@ def fetch_and_prepare_features(feature_cols: list) -> Tuple[pd.DataFrame, float,
         return X_latest, latest_price, latest_dxy, latest_date
 
     except Exception as e:
-        logger.warning(f"⚠️ yfinance API 存取失敗 ({e})，動態讀取 Joblib 快取數據...")
+        logger.warning(f"⚠️ yfinance API 存取失敗 ({e})！")
         
+        # 💡 第一備份順位：優先嘗試讀取本地備用 GC=F_history.csv
+        if os.path.exists(CSV_BACKUP_PATH):
+            try:
+                return fetch_from_csv(CSV_BACKUP_PATH, feature_cols)
+            except Exception as csv_err:
+                logger.warning(f"⚠️ 讀取備用 CSV 失敗 ({csv_err})，切換至 Joblib 快取模式...")
+
+        # 💡 第二備份順位：讀取 Joblib 快取數據
         cached_X = ml_artifacts.get("last_known_X")
         latest_price = ml_artifacts.get("last_known_price")
         latest_dxy = ml_artifacts.get("last_known_dxy")
@@ -250,7 +302,7 @@ def run_prediction_logic():
 def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
     """
     [Tag: Monte Carlo Base-Case Estimation]
-    結合時間序列模型 (Holt-Winters) 與蒙地卡羅隨機模擬，進行基礎情形 (Base Case) 與 P10/P50/P90 波動區間估算。
+    結合時間序列模型 (Holt-Winters) 與蒙地卡羅隨機模擬 (含 CSV 數據支援)
     """
     base_price = ml_artifacts.get("last_known_price")
     base_date = ml_artifacts.get("last_known_date")
@@ -266,14 +318,29 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         base_price = base_price if base_price else 2450.80
         base_date = base_date if base_date else str(pd.Timestamp.today().date())
 
+    gold_series = None
+
+    # 1. 嘗試 yfinance
     try:
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if not gold_df.empty and "Close" in gold_df.columns:
             gold_df["Date"] = pd.to_datetime(gold_df["Date"]).dt.tz_localize(None)
             gold_series = gold_df["Close"].dropna().values
-        else:
-            raise ValueError("yfinance 歷史為空")
     except Exception:
+        pass
+
+    # 2. yfinance 失敗則讀取 CSV
+    if gold_series is None and os.path.exists(CSV_BACKUP_PATH):
+        try:
+            df_csv = pd.read_csv(CSV_BACKUP_PATH)
+            gold_series = df_csv["Close"].dropna().values
+            date_col = "Date" if "Date" in df_csv.columns else df_csv.columns[0]
+            base_date = str(pd.to_datetime(df_csv[date_col]).iloc[-1]).split()[0]
+        except Exception:
+            pass
+
+    # 3. 若皆失敗，使用擬真備份數據
+    if gold_series is None:
         np.random.seed(42)
         gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
 
@@ -283,31 +350,24 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         future_dates = pd.date_range(start=start_dt + pd.Timedelta(days=1), periods=future_days)
         date_labels = [d.strftime("%Y-%m-%d") for d in future_dates]
 
-        # 1. 建立 Holt-Winters 基礎擬合模型 (Base Model)
         model = ExponentialSmoothing(gold_series, trend="add", seasonal=None).fit()
         base_forecast = model.forecast(future_days)
         
-        # 2. 計算歷史日波幅標準差作為隨機噪聲基底
         daily_diffs = np.diff(gold_series)
         volatility = np.std(daily_diffs) if len(daily_diffs) > 0 else 8.0
 
-        # 3. 執行蒙地卡羅隨機模擬 (Monte Carlo Simulations)
         np.random.seed(42)
         simulations = np.zeros((num_simulations, future_days))
         for i in range(num_simulations):
-            # 幾何/隨機漫步累積噪聲 (Cumsum Random Walk)
             shocks = np.random.normal(loc=0.0, scale=volatility * 0.4, size=future_days)
             simulations[i] = base_forecast + np.cumsum(shocks)
 
-        # 4. 統計分位數：P10 (保守/悲觀), P50 (基礎/中位數), P90 (樂觀)
         p10 = np.percentile(simulations, 10, axis=0)
         p50 = np.percentile(simulations, 50, axis=0)
         p90 = np.percentile(simulations, 90, axis=0)
 
-        # 5. 使用 Plotly 繪製 [Tag: Monte Carlo Base-Case Estimation] 區間圖表
         fig = go.Figure()
 
-        # (a) P90 樂觀上限 (作為區域填充參考)
         fig.add_trace(go.Scatter(
             x=date_labels, y=p90,
             mode='lines',
@@ -316,17 +376,15 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
             name='P90 樂觀上限'
         ))
 
-        # (b) P10 保守下限 + P10~P90 波動區間陰影 (Shaded Range)
         fig.add_trace(go.Scatter(
             x=date_labels, y=p10,
             mode='lines',
             line=dict(width=0),
             fill='tonexty',
-            fillcolor='rgba(255, 215, 0, 0.18)', # 半透明金色區間
+            fillcolor='rgba(255, 215, 0, 0.18)',
             name='P10 - P90 波動區間'
         ))
 
-        # (c) P50 基礎情形 (Base Case / 中位數主線)
         fig.add_trace(go.Scatter(
             x=date_labels, y=p50,
             mode='lines+markers',
@@ -335,7 +393,6 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
             name='P50 基礎情形 (Base Case)'
         ))
 
-        # (d) P90 樂觀界線 (虛線)
         fig.add_trace(go.Scatter(
             x=date_labels, y=p90,
             mode='lines',
@@ -343,7 +400,6 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
             name='P90 樂觀估算'
         ))
 
-        # (e) P10 保守界線 (虛線)
         fig.add_trace(go.Scatter(
             x=date_labels, y=p10,
             mode='lines',
@@ -365,27 +421,32 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
-    """歷史走勢折線圖"""
-    base_price = ml_artifacts.get("last_known_price")
-    base_date = ml_artifacts.get("last_known_date")
-    
-    if not base_price and os.path.exists(MODEL_PATH):
-        try:
-            pack = joblib.load(MODEL_PATH)
-            base_price = pack.get("last_known_price", 2450.80)
-            base_date = pack.get("last_known_date", str(pd.Timestamp.today().date()))
-        except Exception:
-            base_price, base_date = 2450.80, str(pd.Timestamp.today().date())
-    else:
-        base_price = base_price if base_price else 2450.80
-        base_date = base_date if base_date else str(pd.Timestamp.today().date())
+    """歷史走勢折線圖 (支援 CSV 歷史數據繪製)"""
+    df = None
 
+    # 1. 嘗試 yfinance
     try:
-        df = yf.Ticker("GC=F").history(period="2mo").reset_index()
-        if df.empty:
-            raise ValueError("yfinance 為空")
-        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+        df_temp = yf.Ticker("GC=F").history(period="2mo").reset_index()
+        if not df_temp.empty:
+            df = df_temp
+            df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
     except Exception:
+        pass
+
+    # 2. 嘗試 CSV
+    if df is None and os.path.exists(CSV_BACKUP_PATH):
+        try:
+            df_csv = pd.read_csv(CSV_BACKUP_PATH)
+            date_col = "Date" if "Date" in df_csv.columns else df_csv.columns[0]
+            df_csv["Date"] = pd.to_datetime(df_csv[date_col]).dt.tz_localize(None)
+            df = df_csv.tail(60).reset_index(drop=True)
+        except Exception:
+            pass
+
+    # 3. 保命機制
+    if df is None:
+        base_price = ml_artifacts.get("last_known_price", 2450.80)
+        base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
         end_dt = pd.to_datetime(base_date)
         dates = pd.date_range(end=end_dt, periods=60, freq='B')
         np.random.seed(42)
