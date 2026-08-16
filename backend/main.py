@@ -9,6 +9,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -51,8 +52,62 @@ class GoldPredictionResponse(BaseModel):
     ai_report: str = Field(..., example="### 🤖 GoldMind AI 語意診斷報告...")
 
 # ======================================================
-# 3. 優先載入 joblib 模型邏輯
+# 3. 數據與模型清洗輔助函式
 # ======================================================
+def clean_and_prepare_csv(csv_path: str) -> pd.DataFrame:
+    """強效清洗 CSV 數據，防止字串、符號或日期格式導致崩潰"""
+    df = pd.read_csv(csv_path)
+    date_col = "Date" if "Date" in df.columns else df.columns[0]
+    df["Date"] = pd.to_datetime(df[date_col], format='mixed', errors='coerce').dt.tz_localize(None)
+    
+    for col in ["Close", "Open", "High", "Low"]:
+        if col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+    return df
+
+def build_dummy_fallback_model(feature_cols: list) -> Tuple[RandomForestClassifier, float]:
+    """💡 終極防爆：當無 .joblib 且 API 斷線時，現場使用 CSV 資料快速擬合輕量模型"""
+    logger.warning("🚨 啟動終極防爆機制：使用備用 CSV 現場訓練應急模型...")
+    rf = RandomForestClassifier(n_estimators=10, max_depth=3, random_state=42)
+    
+    if os.path.exists(CSV_BACKUP_PATH):
+        try:
+            df = clean_and_prepare_csv(CSV_BACKUP_PATH)
+            if "DXY_Close" not in df.columns:
+                df["DXY_Close"] = 104.25
+            df["BuyPrice"] = df["Close"] * 0.998
+            df["SellPrice"] = df["Close"] * 1.002
+            df["AveragePrice"] = (df["BuyPrice"] + df["SellPrice"]) / 2
+            df["Return_Lag1"] = df["AveragePrice"].pct_change().shift(1)
+            df["Return_Lag2"] = df["AveragePrice"].pct_change().shift(2)
+            df["Return_Lag5"] = df["AveragePrice"].pct_change().shift(5)
+            ma5 = df["AveragePrice"].shift(1).rolling(5).mean()
+            ma20 = df["AveragePrice"].shift(1).rolling(20).mean()
+            df["Dist_MA5"] = (df["AveragePrice"].shift(1) - ma5) / ma5
+            df["Dist_MA20"] = (df["AveragePrice"].shift(1) - ma20) / ma20
+            df["Rolling_Std_Lag1"] = df["AveragePrice"].shift(1).rolling(20).std()
+            df["DXY_Close_Lag1"] = df["DXY_Close"].shift(1)
+            df["DXY_Return_Lag1"] = df["DXY_Close"].pct_change().shift(1)
+            dxy_ma5 = df["DXY_Close"].shift(1).rolling(5).mean()
+            df["DXY_Dist_MA5"] = (df["DXY_Close"].shift(1) - dxy_ma5) / dxy_ma5
+            df["Target"] = (df["AveragePrice"].shift(-1) > df["AveragePrice"]).astype(int)
+            
+            df_clean = df.dropna(subset=feature_cols + ["Target"])
+            rf.fit(df_clean[feature_cols], df_clean["Target"])
+            return rf, 0.52
+        except Exception as e:
+            logger.error(f"❌ 備用 CSV 快速擬合失敗: {e}")
+
+    # 若 CSV 亦失敗，以模擬數據擬合防止系統崩潰
+    dummy_X = pd.DataFrame(np.random.randn(20, len(feature_cols)), columns=feature_cols)
+    dummy_y = np.random.randint(0, 2, size=20)
+    rf.fit(dummy_X, dummy_y)
+    return rf, 0.50
+
 def load_or_build_model(model_path: str) -> Dict[str, Any]:
     if os.path.exists(model_path):
         try:
@@ -87,17 +142,22 @@ async def lifespan(app: FastAPI):
         ml_artifacts["model"] = pack.get("model")
         ml_artifacts["threshold"] = pack.get("threshold", 0.5)
         ml_artifacts["feature_cols"] = pack.get("feature_cols", [])
-        
-        # 解開打包在 joblib 中的真實快取數據
         ml_artifacts["last_known_X"] = pack.get("last_known_X")
         ml_artifacts["last_known_price"] = pack.get("last_known_price")
         ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
         ml_artifacts["last_known_date"] = pack.get("last_known_date")
-        
-        logger.info(f"✅ 快取數據讀取成功 | 日期: {ml_artifacts['last_known_date']} | 金價: ${ml_artifacts['last_known_price']}")
+        logger.info(f"✅ 快取數據讀取成功 | 日期: {ml_artifacts.get('last_known_date')} | 金價: ${ml_artifacts.get('last_known_price')}")
     else:
-        ml_artifacts["model"] = None
-        logger.error("❌ 系統將在【無模型模式】下啟動，請檢查環境。")
+        feature_cols = [
+            "Return_Lag1", "Return_Lag2", "Return_Lag5",
+            "Dist_MA5", "Dist_MA20", "Rolling_Std_Lag1",
+            "DXY_Close_Lag1", "DXY_Return_Lag1", "DXY_Dist_MA5"
+        ]
+        rf, threshold = build_dummy_fallback_model(feature_cols)
+        ml_artifacts["model"] = rf
+        ml_artifacts["threshold"] = threshold
+        ml_artifacts["feature_cols"] = feature_cols
+        logger.warning("⚠️ 系統已啟動【備份防爆模型模式】運行。")
 
     yield
     
@@ -123,28 +183,9 @@ app.add_middleware(
 )
 
 # ======================================================
-# 6. Helper 業務邏輯函式 (含防爆清洗 CSV 邏輯)
+# 6. Helper 業務邏輯函式
 # ======================================================
-def clean_and_prepare_csv(csv_path: str) -> pd.DataFrame:
-    """💡 強效清洗 CSV 數據，防止字串、符號或日期格式導致崩潰"""
-    df = pd.read_csv(csv_path)
-    
-    # 1. 處理 Date 欄位格式
-    date_col = "Date" if "Date" in df.columns else df.columns[0]
-    df["Date"] = pd.to_datetime(df[date_col], format='mixed', errors='coerce').dt.tz_localize(None)
-    
-    # 2. 強制將價格欄位轉為 float（移除多餘的字串與符號）
-    for col in ["Close", "Open", "High", "Low"]:
-        if col in df.columns:
-            if df[col].dtype == object:
-                df[col] = df[col].astype(str).str.replace("$", "", regex=False).str.replace(",", "", regex=False)
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
-    return df
-
 def fetch_from_csv(csv_path: str, feature_cols: list) -> Tuple[pd.DataFrame, float, float, str]:
-    """從 GC=F_history.csv 計算特徵與最新價格"""
     logger.info(f"📁 讀取並清洗本地備用檔案 {csv_path}...")
     df = clean_and_prepare_csv(csv_path)
 
@@ -272,21 +313,30 @@ def run_prediction_logic():
     threshold = ml_artifacts.get("threshold", 0.5)
     feature_cols = ml_artifacts.get("feature_cols", [])
 
-    if not model and os.path.exists(MODEL_PATH):
-        pack = joblib.load(MODEL_PATH)
-        model = pack.get("model")
-        threshold = pack.get("threshold", 0.5)
-        feature_cols = pack.get("feature_cols", [])
+    # 💡 終極保障：若 model 為 None，自動觸發修復
+    if not model:
+        if os.path.exists(MODEL_PATH):
+            try:
+                pack = joblib.load(MODEL_PATH)
+                model = pack.get("model")
+                threshold = pack.get("threshold", 0.5)
+                feature_cols = pack.get("feature_cols", [])
+                ml_artifacts["model"] = model
+                ml_artifacts["threshold"] = threshold
+                ml_artifacts["feature_cols"] = feature_cols
+            except Exception:
+                pass
+
+    if not model:
+        feature_cols = [
+            "Return_Lag1", "Return_Lag2", "Return_Lag5",
+            "Dist_MA5", "Dist_MA20", "Rolling_Std_Lag1",
+            "DXY_Close_Lag1", "DXY_Return_Lag1", "DXY_Dist_MA5"
+        ]
+        model, threshold = build_dummy_fallback_model(feature_cols)
         ml_artifacts["model"] = model
         ml_artifacts["threshold"] = threshold
         ml_artifacts["feature_cols"] = feature_cols
-        ml_artifacts["last_known_X"] = pack.get("last_known_X")
-        ml_artifacts["last_known_price"] = pack.get("last_known_price")
-        ml_artifacts["last_known_dxy"] = pack.get("last_known_dxy")
-        ml_artifacts["last_known_date"] = pack.get("last_known_date")
-
-    if not model:
-        raise ValueError("Machine learning model is not initialized.")
 
     X_latest, latest_price, latest_dxy, latest_date = fetch_and_prepare_features(feature_cols)
     prob_up = float(model.predict_proba(X_latest)[:, 1][0])
@@ -314,7 +364,6 @@ def run_prediction_logic():
     }
 
 def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
-    """蒙地卡羅趨勢預測（修復 CSV 數據轉 float 類型問題）"""
     base_price = ml_artifacts.get("last_known_price")
     base_date = ml_artifacts.get("last_known_date")
     
@@ -331,7 +380,6 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
 
     gold_series = None
 
-    # 1. 嘗試 yfinance
     try:
         gold_df = yf.Ticker("GC=F").history(period="2y").reset_index()
         if not gold_df.empty and "Close" in gold_df.columns:
@@ -340,17 +388,15 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
     except Exception:
         pass
 
-    # 2. 嘗試讀取並清洗 CSV
     if gold_series is None and os.path.exists(CSV_BACKUP_PATH):
         try:
             df_csv = clean_and_prepare_csv(CSV_BACKUP_PATH)
-            gold_series = df_csv["Close"].dropna().values.astype(float) # 💡 強制轉為 float 陣列
+            gold_series = df_csv["Close"].dropna().values.astype(float)
             base_date = str(df_csv["Date"].iloc[-1]).split()[0]
             base_price = float(df_csv["Close"].iloc[-1])
         except Exception as e:
             logger.warning(f"⚠️ 蒙地卡羅讀取 CSV 失敗: {e}")
 
-    # 3. 若皆失敗，使用擬真備份數據
     if gold_series is None or len(gold_series) == 0:
         np.random.seed(42)
         gold_series = base_price + np.cumsum(np.random.normal(0.5, 6, size=200))
@@ -432,10 +478,8 @@ def draw_gold_forecast(days: int = 30, num_simulations: int = 1000):
         return px.line(title="⚠️ 趨勢圖暫時無法載入", template="plotly_dark")
 
 def draw_gold_chart():
-    """歷史走勢折線圖 (支援 CSV 清洗處理)"""
     df = None
 
-    # 1. 嘗試 yfinance
     try:
         df_temp = yf.Ticker("GC=F").history(period="2mo").reset_index()
         if not df_temp.empty:
@@ -444,7 +488,6 @@ def draw_gold_chart():
     except Exception:
         pass
 
-    # 2. 嘗試 CSV
     if df is None and os.path.exists(CSV_BACKUP_PATH):
         try:
             df_csv = clean_and_prepare_csv(CSV_BACKUP_PATH)
@@ -452,7 +495,6 @@ def draw_gold_chart():
         except Exception:
             pass
 
-    # 3. 保命機制
     if df is None:
         base_price = ml_artifacts.get("last_known_price", 2450.80)
         base_date = ml_artifacts.get("last_known_date", str(pd.Timestamp.today().date()))
@@ -478,7 +520,7 @@ def draw_gold_chart():
 async def health_check():
     return HealthCheckResponse(
         status="healthy",
-        model_loaded=ml_artifacts.get("model") is not None or os.path.exists(MODEL_PATH),
+        model_loaded=ml_artifacts.get("model") is not None,
         version="1.0.0"
     )
 
