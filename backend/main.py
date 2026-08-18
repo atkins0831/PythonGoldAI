@@ -411,32 +411,34 @@ def run_prediction_logic():
 def draw_gold_chart(ma_selections: List[str] = ["5日均線"]):
   df = None
   try:
-    df_temp = yf.Ticker("GC=F").history(period="3mo").reset_index()
+    df_temp = yf.Ticker("GC=F").history(period="6mo").reset_index()
     if not df_temp.empty:
       df = df_temp
       df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
   except Exception:
     pass
 
+  # 💡 關鍵修正：若讀取備用 CSV，不要太早做 tail(90)，讀取完整資料後再計算 MA
   if df is None and os.path.exists(CSV_BACKUP_PATH):
     try:
-      df_csv = clean_and_prepare_csv(CSV_BACKUP_PATH)
-      df = df_csv.tail(90).reset_index(drop=True)
+      df = clean_and_prepare_csv(CSV_BACKUP_PATH)  # 拿完整的 CSV
     except Exception:
       pass
 
   if df is None:
     base_price = ml_artifacts.get("last_known_price", 2325.40)
-    dates = pd.date_range(end=pd.Timestamp("2026-08-13"), periods=60, freq="B")
+    dates = pd.date_range(end=pd.Timestamp("2026-08-13"), periods=150, freq="B")
     np.random.seed(42)
-    prices = base_price + np.cumsum(np.random.normal(0, 5, size=60))
+    prices = base_price + np.cumsum(np.random.normal(0, 5, size=150))
     df = pd.DataFrame({"Date": dates, "Close": prices})
 
+  # 💡 先算 MA5 / MA10 / MA20 / MA60
   df["MA5"] = df["Close"].rolling(5).mean()
   df["MA10"] = df["Close"].rolling(10).mean()
   df["MA20"] = df["Close"].rolling(20).mean()
   df["MA60"] = df["Close"].rolling(60).mean()
 
+  # 💡 算完 MA 之後，最後才取近 60 日繪圖！
   df_plot = df.tail(60).reset_index(drop=True)
 
   fig = go.Figure()
@@ -647,24 +649,23 @@ async def get_history_chart_data(
 ):
   df = None
   try:
-    df_temp = yf.Ticker("GC=F").history(period="4mo").reset_index()
+    df_temp = yf.Ticker("GC=F").history(period="6mo").reset_index()
     if not df_temp.empty:
       df = df_temp
       df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
   except Exception:
     pass
 
+  # 💡 關鍵修正：取完整 CSV 算完 MA 再 tail
   if df is None and os.path.exists(CSV_BACKUP_PATH):
     try:
-      df = clean_and_prepare_csv(CSV_BACKUP_PATH).tail(100).reset_index(
-          drop=True
-      )
+      df = clean_and_prepare_csv(CSV_BACKUP_PATH)
     except Exception:
       pass
 
   if df is None:
-    dates = pd.date_range(end=pd.Timestamp("2026-08-13"), periods=100, freq="B")
-    prices = 2325.40 + np.cumsum(np.random.normal(0, 5, size=100))
+    dates = pd.date_range(end=pd.Timestamp("2026-08-13"), periods=150, freq="B")
+    prices = 2325.40 + np.cumsum(np.random.normal(0, 5, size=150))
     df = pd.DataFrame({"Date": dates, "Close": prices})
 
   df["MA5"] = df["Close"].rolling(5).mean()
@@ -672,6 +673,7 @@ async def get_history_chart_data(
   df["MA20"] = df["Close"].rolling(20).mean()
   df["MA60"] = df["Close"].rolling(60).mean()
 
+  # 💡 計算完成後取最後 limit 筆
   df_sub = df.tail(limit).reset_index(drop=True)
 
   result_points = [
