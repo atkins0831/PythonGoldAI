@@ -3,8 +3,8 @@ import requests
 import yfinance as yf
 
 symbol = "DX-Y.NYB"  # 美元指數代碼
-start_date = "2024-08-11"  # 開始日期 (建議拉長至 2 年，利於計算 MA60)
-end_date = "2026-08-18"  # 結束日期 (需比目標日期多 1 天，才能包含 08-17 當天)
+start_date = "2024-11-24"  # 開始日期 (建議拉長至 2 年，利於計算 MA60)
+end_date = "2026-11-24"  # 結束日期 (需比目標日期多 1 天，才能包含 08-17 當天)
 interval = "1d"  # 資料頻率 (1d/1w/1mo)
 
 print(f"⏳ 正在下載 {symbol} (美元指數) 歷史數據...")
